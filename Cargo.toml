@@ -1,0 +1,9 @@
+[package]
+
+name = "rust-marpa"
+version = "0.0.1"
+authors = [ "pioczarn@gmail.com" ]
+
+[lib]
+name = "marpa"
+crate_type = ["dylib"]
