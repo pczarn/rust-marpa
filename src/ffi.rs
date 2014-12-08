@@ -2,8 +2,7 @@ pub type SymbolId = i32;
 pub type RuleId = i32;
 pub type EarleySetId = i32;
 pub type EarleyItemId = i32;
-pub type Earleme = i32;
-pub type StepType = i32;
+pub type EarlemeId = i32;
 
 pub enum MarpaGrammar {}
 pub enum MarpaRecce {}
@@ -58,13 +57,14 @@ pub enum Step {
 extern {
     pub fn marpa_c_init(config: *mut Config) -> i32;
 
-    pub fn marpa_g_new(config: *const Config) -> *mut MarpaGrammar;
+    pub fn marpa_g_new(config: *mut Config) -> *mut MarpaGrammar;
     pub fn marpa_g_ref(grammar: *mut MarpaGrammar) -> *mut MarpaGrammar;
 
     pub fn marpa_g_unref(grammar: *mut MarpaGrammar);
     pub fn marpa_g_precompute(grammar: *mut MarpaGrammar) -> i32;
     pub fn marpa_g_is_precomputed(grammar: *mut MarpaGrammar) -> i32;
     pub fn marpa_g_symbol_new(grammar: *mut MarpaGrammar) -> SymbolId;
+    pub fn marpa_g_start_symbol(grammar: *mut MarpaGrammar) -> SymbolId;
     pub fn marpa_g_start_symbol_set(grammar: *mut MarpaGrammar, sym: SymbolId) -> SymbolId;
     pub fn marpa_g_rule_new(g: *mut MarpaGrammar, lhs_id: SymbolId, rhs_ids: *const SymbolId,
                                                                     length: i32) -> RuleId;
@@ -75,7 +75,7 @@ extern {
     pub fn marpa_r_start_input(recce: *mut MarpaRecce) -> i32;
     pub fn marpa_r_alternative(recce: *mut MarpaRecce, token_id: SymbolId, value: i32,
                                                                            length: i32) -> i32;
-    pub fn marpa_r_earleme_complete(recce: *mut MarpaRecce) -> Earleme;
+    pub fn marpa_r_earleme_complete(recce: *mut MarpaRecce) -> EarlemeId;
     pub fn marpa_r_latest_earley_set(recce: *mut MarpaRecce) -> EarleySetId;
 
     pub fn marpa_b_new(recce: *mut MarpaRecce, earley_set_id: EarleySetId) -> *mut MarpaBocage;

@@ -1,5 +1,7 @@
 #![crate_name = "marpa"]
 
+#![feature(plugin_registrar, macro_rules, unsafe_destructor)]
+
 extern crate libc;
 
 pub use ffi::{Config, Step};

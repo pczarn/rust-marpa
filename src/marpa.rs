@@ -1,62 +1,103 @@
 use ffi;
 
-#[repr(packed)]
-pub struct Symbol {
-    sym: ffi::SymbolId,
-}
+use std::kinds::marker;
+use std::ptr;
 
-#[deriving(PartialEq, Eq)]
-pub struct Rule {
-    id: ffi::RuleId,
-}
-
-pub struct EarleySet {
-    id: ffi::EarleySetId,
-}
-
-pub struct Grammar {
-    g: *mut ffi::MarpaGrammar,
-}
-
-impl Grammar {
-    pub fn new(config: &mut ffi::Config) -> Grammar {
-        let g = unsafe {
-            ffi::marpa_g_new(&*config)
-        };
-        Grammar { g: g }
-    }
-
-    pub fn add_symbol(&self) -> Symbol {
-        Symbol {
-            sym: unsafe { ffi::marpa_g_symbol_new(self.g) },
+macro_rules! numbered_object_type (
+    ($Ty:ident, $Id:ty) => (
+        #[repr(packed)]
+        #[deriving(PartialEq, Eq)]
+        pub struct $Ty {
+            id: $Id,
         }
-    }
-
-    pub fn add_rule(&self, lhs: Symbol, rhs: &[Symbol]) -> Rule {
-        Rule {
-            id: unsafe {
-                ffi::marpa_g_rule_new(self.g, lhs.sym, rhs.as_ptr() as *const _, rhs.len() as i32)
+        impl $Ty {
+            fn new(id: $Id) -> Option<$Ty> {
+                if id < 0 {
+                    None
+                } else {
+                    Some($Ty { id: id })
+                }
             }
         }
+    )
+)
+
+numbered_object_type!(Earleme, ffi::EarlemeId)
+numbered_object_type!(EarleyItem, ffi::EarleyItemId)
+numbered_object_type!(EarleySet, ffi::EarleySetId)
+numbered_object_type!(Symbol, ffi::SymbolId)
+numbered_object_type!(Rule, ffi::RuleId)
+
+pub struct Grammar<'a> {
+    grammar: *mut ffi::MarpaGrammar,
+    marker: marker::ContravariantLifetime<'a>,
+}
+
+impl<'a> Grammar<'a> {
+    pub fn new() -> Option<Grammar<'static>> {
+        let g_ptr = unsafe {
+            ffi::marpa_g_new(ptr::null_mut())
+        };
+        if g_ptr.is_null() {
+            None
+        } else {
+            Some(Grammar { grammar: g_ptr, marker: marker::ContravariantLifetime })
+        }
     }
 
-    pub fn set_start_symbol(&self, sym: Symbol) {
-        unsafe {
-            ffi::marpa_g_start_symbol_set(self.g, sym.sym); // -> ?
+    pub fn with_config(config: &mut ffi::Config) -> Option<Grammar> {
+        let g_ptr = unsafe {
+            ffi::marpa_g_new(config)
+        };
+        if g_ptr.is_null() {
+            None
+        } else {
+            Some(Grammar { grammar: g_ptr, marker: marker::ContravariantLifetime })
         }
+    }
+
+    pub fn symbol_new(&self) -> Option<Symbol> {
+        Symbol::new(unsafe {
+            ffi::marpa_g_symbol_new(self.grammar)
+        })
+    }
+
+    pub fn rule_new(&self, lhs: Symbol, rhs: &[Symbol]) -> Option<Rule> {
+        Rule::new(unsafe {
+            ffi::marpa_g_rule_new(self.grammar, lhs.id, rhs.as_ptr() as *const _, rhs.len() as i32)
+        })
+    }
+
+    pub fn start_symbol_set(&self, sym: Symbol) -> Option<Symbol> {
+        Symbol::new(unsafe {
+            ffi::marpa_g_start_symbol_set(self.grammar, sym.id)
+        })
+    }
+
+    pub fn start_symbol(&self) -> Option<Symbol> {
+        Symbol::new(unsafe {
+            ffi::marpa_g_start_symbol(self.grammar)
+        })
     }
 
     pub fn precompute(&self) {
         unsafe {
-            ffi::marpa_g_precompute(self.g);
+            ffi::marpa_g_precompute(self.grammar);
+        }
+    }
+
+    pub fn is_precomputed(&self) -> bool {
+        unsafe {
+            ffi::marpa_g_is_precomputed(self.grammar) == 1
         }
     }
 }
 
-impl Drop for Grammar {
+#[unsafe_destructor]
+impl<'a> Drop for Grammar<'a> {
     fn drop(&mut self) {
         unsafe {
-            ffi::marpa_g_unref(self.g);
+            ffi::marpa_g_unref(self.grammar);
         }
     }
 }
@@ -66,38 +107,41 @@ pub struct Recognizer {
 }
 
 impl Recognizer {
-    pub fn new(grammar: &Grammar) -> Recognizer {
-        Recognizer {
-            recce: unsafe {
-                ffi::marpa_r_new(grammar.g)
-            }
+    pub fn new(grammar: &Grammar) -> Option<Recognizer> {
+        let recce_ptr = unsafe {
+            ffi::marpa_r_new(grammar.grammar)
+        };
+        if recce_ptr.is_null() {
+            None
+        } else {
+            Some(Recognizer { recce: recce_ptr })
         }
     }
 
-    pub fn start_input(&self) {
+    pub fn start_input(&self) -> bool {
         unsafe {
-            ffi::marpa_r_start_input(self.recce);
+            ffi::marpa_r_start_input(self.recce) >= 0
         }
     }
 
     pub fn alternative(&self, token_id: Symbol, value: i32, length: i32) {
+        // TODO: return value
         unsafe {
-            ffi::marpa_r_alternative(self.recce, token_id.sym, value, length);
+            ffi::marpa_r_alternative(self.recce, token_id.id, value, length);
         }
     }
 
-    pub fn earleme_complete(&self) {
-        unsafe {
-            ffi::marpa_r_earleme_complete(self.recce);
-        }
+    /// An exhausted parse may cause a failure.
+    pub fn earleme_complete(&self) -> Option<Earleme> {
+        Earleme::new(unsafe {
+            ffi::marpa_r_earleme_complete(self.recce)
+        })
     }
 
     pub fn latest_earley_set(&self) -> EarleySet {
-        EarleySet {
-            id: unsafe {
-                ffi::marpa_r_latest_earley_set(self.recce)
-            }
-        }
+        EarleySet::new(unsafe {
+            ffi::marpa_r_latest_earley_set(self.recce)
+        }).unwrap()
     }
 }
 
@@ -114,9 +158,14 @@ pub struct Bocage {
 }
 
 impl Bocage {
-    pub fn new(recce: &Recognizer, earley_set: EarleySet) -> Bocage {
-        Bocage {
-            bocage: unsafe { ffi::marpa_b_new(recce.recce, earley_set.id) },
+    pub fn new(recce: &Recognizer, earley_set: EarleySet) -> Option<Bocage> {
+        let bocage_ptr = unsafe {
+            ffi::marpa_b_new(recce.recce, earley_set.id)
+        };
+        if bocage_ptr.is_null() {
+            None
+        } else {
+            Some(Bocage { bocage: bocage_ptr })
         }
     }
 }
@@ -134,11 +183,14 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn new(bocage: &Bocage) -> Order {
-        Order {
-            order: unsafe {
-                ffi::marpa_o_new(bocage.bocage)
-            }
+    pub fn new(bocage: &Bocage) -> Option<Order> {
+        let order_ptr = unsafe {
+            ffi::marpa_o_new(bocage.bocage)
+        };
+        if order_ptr.is_null() {
+            None
+        } else {
+            Some(Order { order: order_ptr })
         }
     }
 }
@@ -156,17 +208,26 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub fn new(order: &Order) -> Tree {
-        Tree {
-            tree: unsafe {
-                ffi::marpa_t_new(order.order)
-            }
+    pub fn new(order: &Order) -> Option<Tree> {
+        let tree_ptr = unsafe {
+            ffi::marpa_t_new(order.order)
+        };
+        if tree_ptr.is_null() {
+            None
+        } else {
+            Some(Tree { tree: tree_ptr })
         }
     }
 
     pub fn next(&self) -> i32 {
         unsafe {
             ffi::marpa_t_next(self.tree)
+        }
+    }
+
+    pub fn values(&self) -> Values {
+        Values {
+            tree: self,
         }
     }
 }
@@ -184,11 +245,14 @@ pub struct Value {
 }
 
 impl Value {
-    pub fn new(tree: &Tree) -> Value {
-        Value {
-            value: unsafe {
-                ffi::marpa_v_new(tree.tree)
-            }
+    pub fn new(tree: &Tree) -> Option<Value> {
+        let val_ptr = unsafe {
+            ffi::marpa_v_new(tree.tree)
+        };
+        if val_ptr.is_null() {
+            None
+        } else {
+            Some(Value { value: val_ptr })
         }
     }
 
@@ -206,7 +270,7 @@ impl Value {
 
     pub fn symbol_is_valued_set(&self, sym: Symbol, n: i32) {
         unsafe {
-            ffi::marpa_v_symbol_is_valued_set(self.value, sym.sym, n);
+            ffi::marpa_v_symbol_is_valued_set(self.value, sym.id, n);
         }
     }
 
@@ -237,6 +301,20 @@ impl Drop for Value {
     fn drop(&mut self) {
         unsafe {
             ffi::marpa_v_unref(self.value);
+        }
+    }
+}
+
+pub struct Values<'a> {
+    tree: &'a Tree,
+}
+
+impl<'a> Iterator<Value> for Values<'a> {
+    fn next(&mut self) -> Option<Value> {
+        if self.tree.next() >= 0 {
+            Value::new(self.tree)
+        } else {
+            None
         }
     }
 }
