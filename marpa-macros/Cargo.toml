@@ -1,0 +1,13 @@
+[package]
+
+name = "rust-marpa-macros"
+version = "0.0.1"
+authors = [ "pioczarn@gmail.com" ]
+
+[lib]
+name = "marpa-macros"
+crate_type = ["dylib"]
+plugin = true
+
+[dependencies.rust-marpa]
+path = ".."
