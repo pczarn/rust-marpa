@@ -16,7 +16,6 @@ use syntax::ext::base::{ExtCtxt, MacResult, MacExpr};
 use syntax::parse::token;
 use syntax::parse::parser::Parser;
 use syntax::parse;
-// use syntax::ptr::P;
 use syntax::util::interner::StrInterner;
 use syntax::ptr::P;
 use syntax::ext::build::AstBuilder;
@@ -25,13 +24,8 @@ use std::collections::HashSet;
 use std::collections::HashMap;
 use std::mem;
 
-// #[macro_export]
-// macro_rules! exported_macro (() => (2i))
-
 #[plugin_registrar]
 pub fn plugin_registrar(reg: &mut ::rustc::plugin::Registry) {
-    // reg.register_syntax_extension(token::intern("grammar"),
-    //     base::Modifier(box expand_grammar));
     reg.register_macro("grammar", expand_grammar);
 }
 
@@ -143,8 +137,6 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     let mut g1_rules = vec![];
     let mut l0_rules = vec![];
 
-    // let mut g1_syms = HashMap::new();
-    // let mut g1_symvec = vec![];
     let mut g1_syms = StrInterner::new();
     let start_sym = g1_syms.gensym(":start");
 
@@ -168,6 +160,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         }
     }
 
+    // prepare grammar rules
+
     let mut g1_rules_cont = vec![];
     for rule in g1_rules.into_iter() {
         match rule {
@@ -189,35 +183,18 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     let num_syms = g1_syms.len();
 
     // LEXER -- L0
-
     let reg_alt = l0_rules.iter().map(|&(l0_sym_id, ref l0_reg)| l0_reg.get().into_string()).collect::<Vec<_>>().connect(")|(");
     let scan_syms = l0_rules.iter().map(|&(l0_sym_id, _)| l0_sym_id).collect::<Vec<_>>();
     let ast::Name(scan_syms_0) = scan_syms[0];
     let num_scan_syms = l0_rules.len();
     let reg_alt = format!("({})", reg_alt);
 
-    // rest
-
-    println!("{}\n{}\n{}\n{}", g1_rules_cont, g1_seq_rules, l0_rules, reg_alt);
-
+    // ``` let scan_syms = [syms[$l0_sym_id0], syms[$l0_sym_id1], ...]; ```
     let scan_syms_exprs = l0_rules.iter().map(|&(ast::Name(l0_sym_id), _)| quote_expr!(cx, syms[$l0_sym_id as uint])).collect::<Vec<_>>();
-
     let scan_syms_expr = cx.expr_vec(sp, scan_syms_exprs);
     let let_scan_syms_stmt = cx.stmt_let(sp, false, cx.ident_of("scan_syms"), scan_syms_expr);
 
-    // let fmtsp = piece_ty.span;
-    // let fmt = ecx.expr_vec(fmtsp, rule_exprs);
-    // let fmt = ecx.expr_addr_of(fmtsp, fmt);
-    // let ty = ast::TyVec(piece_ty);
-    // let ty = ast::TyRptr(Some(ecx.lifetime(fmtsp, special_idents::static_lifetime.name)),
-    //                      ast::MutTy{ mutbl: ast::MutImmutable, ty: ecx.ty(fmtsp, ty) });
-    // let ty = ecx.ty(fmtsp, ty);
-    // let st = ast::ItemStatic(ty, ast::MutImmutable, fmt);
-    // let item = ecx.item(fmtsp, name, Context::static_attrs(ecx, fmtsp), st);
-    // let decl = respan(fmtsp, ast::DeclItem(item));
-    // let rules_stmt = P(respan(fmtsp, ast::StmtDecl(P(decl), ast::DUMMY_NODE_ID)));
-
-    // let mut rule_exprs = vec![];
+    // RULES -- G1
     let mut rhs_exprs = vec![];
     let rule_exprs = g1_rules_cont.iter().chain(g1_seq_rules.iter()).map(|&(ast::Name(lhs), ref rhs)| {
         match rhs {
@@ -235,20 +212,21 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             _ => panic!()
         }
 
-        let r = cx.expr_tuple(sp, vec![
+        return cx.expr_tuple(sp, vec![
             quote_expr!(cx, syms[$lhs as uint]),
             cx.expr_vec_slice(sp, mem::replace(&mut rhs_exprs, vec![])),
-        ]);
-
-        // rhs_exprs.clear();
-        r
+        ])
     }).collect::<Vec<_>>();
 
+    // ``` let rules = &[$rule_exprs]; ```
     let num_rules = rule_exprs.len();
-
-    // let rules = &[$rule_exprs];
     let rules_expr = cx.expr_vec(sp, rule_exprs);
-    let let_rules_stmt = cx.stmt_let_typed(sp, false, cx.ident_of("rules"), quote_ty!(cx, [(::marpa::Symbol, &[::marpa::Symbol]), ..$num_rules]), rules_expr);
+    let let_rules_stmt =
+        cx.stmt_let_typed(sp,
+                          false,
+                          cx.ident_of("rules"),
+                          quote_ty!(cx, [(::marpa::Symbol, &[::marpa::Symbol]), ..$num_rules]),
+                          rules_expr);
 
     let g_expr = quote_expr!(cx,
         {
@@ -312,22 +290,5 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         }
     );
 
-    // let sym_stmt = quote_stmt!(cx, let syms: [::marpa::Symbol, ..$num_syms] = unsafe { ::std::mem::uninitialized() };
-    //     for sym in syms.iter_mut() { *sym = grammar.symbol_new().unwrap(); });
-
     MacExpr::new(g_expr)
 }
-
-// grammar! {
-//     :start ::= expr ;
-//     expr ::= expr op expr | number ;
-//     number ~ r"\d" ;
-//     op ~ r"[\*\+\-]" ;
-// }
-
-// grammar! {
-//     ident ~ \w+ ;
-//     rule ::= lhs '::=' rhs ';' ;
-//     rhs ::= rhs '|' rhs | ident '+' | ident '*' | ident ;
-//     lhs ::= ident ;
-// }
