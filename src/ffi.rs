@@ -4,12 +4,13 @@ pub type EarleySetId = i32;
 pub type EarleyItemId = i32;
 pub type EarlemeId = i32;
 
-pub enum MarpaGrammar {}
-pub enum MarpaRecce {}
-pub enum MarpaBocage {}
-pub enum MarpaOrder {}
-pub enum MarpaTree {}
+#[deriving(Copy)] pub enum MarpaGrammar {}
+#[deriving(Copy)] pub enum MarpaRecce {}
+#[deriving(Copy)] pub enum MarpaBocage {}
+#[deriving(Copy)] pub enum MarpaOrder {}
+#[deriving(Copy)] pub enum MarpaTree {}
 
+#[deriving(Copy)]
 #[repr(C)]
 pub struct MarpaValue {
     pub t_step_type: Step,
@@ -24,22 +25,35 @@ pub struct MarpaValue {
     pub t_ys_id: EarleySetId,
 }
 
+/// The configuration structure is intended for future extensions. Currently, the only function
+/// of the config is to give `Grammar::with_config` a place to put its error code.
+#[allow(raw_pointer_deriving)]
+#[deriving(Copy)]
 #[repr(C)]
 pub struct Config {
     t_is_ok: i32,
-    t_error: i32,
+    t_error: ErrorCode,
     t_error_str: *const u8,
 }
 
 impl Config {
+    /// Creates a config initialized to default values.
     pub fn new() -> Config {
-        let mut cfg = Config { t_is_ok: 0, t_error: 0, t_error_str: 0u as *const _ };
+        let mut cfg = Config {
+            t_is_ok: 0,
+            t_error: ErrorCode::ErrNone,
+            t_error_str: 0u as *const _
+        };
         unsafe { marpa_c_init(&mut cfg); }
         cfg
     }
+
+    pub fn error_code(&self) -> ErrorCode {
+        self.t_error
+    }
 }
 
-#[deriving(Show)]
+#[deriving(Copy, Show)]
 #[repr(C)]
 pub enum Step {
     StepInternal1 = 0,
@@ -51,6 +65,110 @@ pub enum Step {
     StepInternal2 = 6,
     StepInitial = 7,
     StepCount = 8,
+}
+
+#[deriving(Copy, Show)]
+#[repr(i32)]
+pub enum ErrorCode {
+    ErrNone = 0,
+    AhfaIxNegative = 1,
+    AhfaIxOob = 2,
+    AndidNegative = 3,
+    AndidNotInOr = 4,
+    AndixNegative = 5,
+    BadSeparator = 6,
+    BocageIterationExhausted = 7,
+    CountedNullable = 8,
+    Development = 9,
+    DuplicateAndNode = 10,
+    DuplicateRule = 11,
+    DuplicateToken = 12,
+    YimCount = 13,
+    YimIdInvalid = 14,
+    EventIxNegative = 15,
+    EventIxOob = 16,
+    GrammarHasCycle = 17,
+    InaccessibleToken = 18,
+    Internal = 19,
+    InvalidAhfaId = 20,
+    InvalidAimid = 21,
+    InvalidBoolean = 22,
+    InvalidIrlid = 23,
+    InvalidNsyid = 24,
+    InvalidLocation = 25,
+    InvalidRuleId = 26,
+    InvalidStartSymbol = 27,
+    InvalidSymbolId = 28,
+    IAmNotOk = 29,
+    MajorVersionMismatch = 30,
+    MicroVersionMismatch = 31,
+    MinorVersionMismatch = 32,
+    NookidNegative = 33,
+    NotPrecomputed = 34,
+    NotTracingCompletionLinks = 35,
+    NotTracingLeoLinks = 36,
+    NotTracingTokenLinks = 37,
+    NoAndNodes = 38,
+    NoEarleySetAtLocation = 39,
+    NoOrNodes = 40,
+    NoParse = 41,
+    NoRules = 42,
+    NoStartSymbol = 43,
+    NoTokenExpectedHere = 44,
+    NoTraceYim = 45,
+    NoTraceYs = 46,
+    NoTracePim = 47,
+    NoTraceSrcl = 48,
+    NullingTerminal = 49,
+    OrderFrozen = 50,
+    OridNegative = 51,
+    OrAlreadyOrdered = 52,
+    ParseExhausted = 53,
+    ParseTooLong = 54,
+    PimIsNotLim = 55,
+    PointerArgNull = 56,
+    Precomputed = 57,
+    ProgressReportExhausted = 58,
+    ProgressReportNotStarted = 59,
+    RecceNotAcceptingInput = 60,
+    RecceNotStarted = 61,
+    RecceStarted = 62,
+    RhsIxNegative = 63,
+    RhsIxOob = 64,
+    RhsTooLong = 65,
+    SequenceLhsNotUnique = 66,
+    SourceTypeIsAmbiguous = 67,
+    SourceTypeIsCompletion = 68,
+    SourceTypeIsLeo = 69,
+    SourceTypeIsNone = 70,
+    SourceTypeIsToken = 71,
+    SourceTypeIsUnknown = 72,
+    StartNotLhs = 73,
+    SymbolValuedConflict = 74,
+    TerminalIsLocked = 75,
+    TokenIsNotTerminal = 76,
+    TokenLengthLeZero = 77,
+    TokenTooLong = 78,
+    TreeExhausted = 79,
+    TreePaused = 80,
+    UnexpectedTokenId = 81,
+    UnproductiveStart = 82,
+    ValuatorInactive = 83,
+    ValuedIsLocked = 84,
+    RankTooLow = 85,
+    RankTooHigh = 86,
+    SymbolIsNulling = 87,
+    SymbolIsUnused = 88,
+    NoSuchRuleId = 89,
+    NoSuchSymbolId = 90,
+    BeforeFirstTree = 91,
+    SymbolIsNotCompletionEvent = 92,
+    SymbolIsNotNulledEvent = 93,
+    SymbolIsNotPredictionEvent = 94,
+    RecceIsInconsistent = 95,
+    InvalidAssertionId = 96,
+    NoSuchAssertionId = 97,
+    HeadersDoNotMatch = 98,
 }
 
 #[link(name = "marpa")]
@@ -69,12 +187,16 @@ extern {
     pub fn marpa_g_rule_new(g: *mut MarpaGrammar, lhs_id: SymbolId, rhs_ids: *const SymbolId,
                                                                     length: i32) -> RuleId;
 
+    pub fn marpa_g_error(grammar: *mut MarpaGrammar, p_error_string: *const *const u8) -> ErrorCode;
+    pub fn marpa_g_error_clear(grammar: *mut MarpaGrammar) -> ErrorCode;
+
     pub fn marpa_r_new(g: *mut MarpaGrammar) -> *mut MarpaRecce;
     pub fn marpa_r_unref(r: *mut MarpaRecce);
 
     pub fn marpa_r_start_input(recce: *mut MarpaRecce) -> i32;
-    pub fn marpa_r_alternative(recce: *mut MarpaRecce, token_id: SymbolId, value: i32,
-                                                                           length: i32) -> i32;
+    pub fn marpa_r_alternative(recce: *mut MarpaRecce, token_id: SymbolId,
+                                                       value: i32,
+                                                       length: i32) -> ErrorCode;
     pub fn marpa_r_earleme_complete(recce: *mut MarpaRecce) -> EarlemeId;
     pub fn marpa_r_latest_earley_set(recce: *mut MarpaRecce) -> EarleySetId;
 

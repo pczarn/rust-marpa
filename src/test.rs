@@ -5,7 +5,7 @@ use std::str::CowString;
 #[test]
 fn test_simple_with_cfg() {
     let mut cfg = Config::new();
-    Grammar::with_config(&mut cfg);
+    Grammar::with_config(&mut cfg).unwrap();
 }
 
 #[deriving(Show)]
@@ -27,7 +27,7 @@ fn test_ambiguous_parse() {
     ];
 
     let mut cfg = Config::new();
-    let g = Grammar::with_config(&mut cfg).unwrap();
+    let mut g = Grammar::with_config(&mut cfg).unwrap();
 
     let s = g.symbol_new().unwrap();
     let e = g.symbol_new().unwrap();
@@ -37,9 +37,9 @@ fn test_ambiguous_parse() {
     let start_rule  = g.rule_new(s, &[e]).unwrap();
     let op_rule     = g.rule_new(e, &[e, op, e]).unwrap();
     let number_rule = g.rule_new(e, &[number]).unwrap();
-    g.precompute();
+    g.precompute().unwrap();
 
-    let r = Recognizer::new(&g).unwrap();
+    let mut r = Recognizer::new(&mut g).unwrap();
     r.start_input();
 
     let tok_symbols = [number, number, number, number, number, op, op, op];
@@ -55,13 +55,13 @@ fn test_ambiguous_parse() {
     }
 
     let latest_es = r.latest_earley_set();
-    let bocage = Bocage::new(&r, latest_es).unwrap();
-    let order = Order::new(&bocage).unwrap();
-    let tree = Tree::new(&order).unwrap();
+    let mut bocage = Bocage::new(&mut r, latest_es).unwrap();
+    let mut order = Order::new(&mut bocage).unwrap();
+    let mut tree = Tree::new(&mut order).unwrap();
 
     let mut stack: Vec<Node> = vec![];
 
-    for valuator in tree.values() {
+    for mut valuator in tree.values() {
         valuator.rule_is_valued_set(op_rule, 1);
         valuator.rule_is_valued_set(start_rule, 1);
         valuator.rule_is_valued_set(number_rule, 1);
@@ -77,11 +77,11 @@ fn test_ambiguous_parse() {
                      })
                 }
                 Step::StepRule => {
+                    let rule = valuator.rule();
                     let arg_0 = valuator.arg_0() as uint;
                     let arg_n = valuator.arg_n() as uint;
                     let &Node { formatted: ref left_str,  value: lval } = &stack[arg_0];
                     let &Node { formatted: ref right_str, value: rval } = &stack[arg_n];
-                    let rule = valuator.rule();
 
                     let elem = if start_rule == rule {
                         Node {

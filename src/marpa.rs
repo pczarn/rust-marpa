@@ -1,16 +1,17 @@
 use ffi;
+use ffi::ErrorCode;
 
-use std::kinds::marker;
 use std::ptr;
 
-macro_rules! numbered_object_type (
+macro_rules! numbered_object_type {
     ($Ty:ident, $Id:ty) => (
         #[repr(packed)]
-        #[deriving(PartialEq, Eq)]
+        #[deriving(Copy, PartialEq, Eq)]
         pub struct $Ty {
             id: $Id,
         }
         impl $Ty {
+            #[allow(dead_code)]
             fn new(id: $Id) -> Option<$Ty> {
                 if id < 0 {
                     None
@@ -20,72 +21,109 @@ macro_rules! numbered_object_type (
             }
         }
     )
-)
-
-numbered_object_type!(Earleme, ffi::EarlemeId)
-numbered_object_type!(EarleyItem, ffi::EarleyItemId)
-numbered_object_type!(EarleySet, ffi::EarleySetId)
-numbered_object_type!(Symbol, ffi::SymbolId)
-numbered_object_type!(Rule, ffi::RuleId)
-
-pub struct Grammar<'a> {
-    grammar: *mut ffi::MarpaGrammar,
-    marker: marker::ContravariantLifetime<'a>,
 }
 
-impl<'a> Grammar<'a> {
-    pub fn new() -> Option<Grammar<'static>> {
+numbered_object_type!(Earleme, ffi::EarlemeId);
+numbered_object_type!(EarleyItem, ffi::EarleyItemId);
+numbered_object_type!(EarleySet, ffi::EarleySetId);
+numbered_object_type!(Symbol, ffi::SymbolId);
+numbered_object_type!(Rule, ffi::RuleId);
+
+
+
+/// A grammar. Grammars have no parent objects.
+pub struct Grammar {
+    grammar: *mut ffi::MarpaGrammar
+}
+
+impl Grammar {
+    /// Constructs a new grammar. The returned grammar object is not yet precomputed, and will
+    /// have no symbols and rules. Its reference count will be 1.
+    pub fn new() -> Option<Grammar> {
         let g_ptr = unsafe {
             ffi::marpa_g_new(ptr::null_mut())
         };
         if g_ptr.is_null() {
             None
         } else {
-            Some(Grammar { grammar: g_ptr, marker: marker::ContravariantLifetime })
+            Some(Grammar { grammar: g_ptr })
         }
     }
 
-    pub fn with_config(config: &mut ffi::Config) -> Option<Grammar> {
+    /// Constructs a new grammar.
+    ///
+    /// # Errors
+    ///
+    /// If an error happens during grammar construction, the `ErrorCode` is returned as an `Err`.
+    pub fn with_config(config: &mut ffi::Config) -> Result<Grammar, ErrorCode> {
         let g_ptr = unsafe {
             ffi::marpa_g_new(config)
         };
         if g_ptr.is_null() {
-            None
+            Err(config.error_code())
         } else {
-            Some(Grammar { grammar: g_ptr, marker: marker::ContravariantLifetime })
+            Ok(Grammar { grammar: g_ptr })
         }
     }
 
-    pub fn symbol_new(&self) -> Option<Symbol> {
+    /// Creates a new symbol. Returns `None` on failure.
+    pub fn symbol_new(&mut self) -> Option<Symbol> {
         Symbol::new(unsafe {
             ffi::marpa_g_symbol_new(self.grammar)
         })
     }
 
-    pub fn rule_new(&self, lhs: Symbol, rhs: &[Symbol]) -> Option<Rule> {
+    /// Creates a new rule. Returns `None` on failure.
+    pub fn rule_new(&mut self, lhs: Symbol, rhs: &[Symbol]) -> Option<Rule> {
         Rule::new(unsafe {
             ffi::marpa_g_rule_new(self.grammar, lhs.id, rhs.as_ptr() as *const _, rhs.len() as i32)
         })
     }
 
-    pub fn start_symbol_set(&self, sym: Symbol) -> Option<Symbol> {
-        Symbol::new(unsafe {
-            ffi::marpa_g_start_symbol_set(self.grammar, sym.id)
-        })
-    }
-
+    /// Returns current value of the start symbol of the grammar, or `None` if one hasn't been set
+    /// with `start_symbol_set`.
     pub fn start_symbol(&self) -> Option<Symbol> {
         Symbol::new(unsafe {
             ffi::marpa_g_start_symbol(self.grammar)
         })
     }
 
-    pub fn precompute(&self) {
+    /// Sets the start symbol of the grammar to `sym`. Returns the value of the new start symbol,
+    /// or `None` if `sym` is well-formed, but there is no such symbol.
+    pub fn start_symbol_set(&mut self, sym: Symbol) -> Option<Symbol> {
+        Symbol::new(unsafe {
+            ffi::marpa_g_start_symbol_set(self.grammar, sym.id)
+        })
+    }
+
+    /// Precomputation involves freezing and then thoroughly checking the grammar.
+    ///
+    /// # Errors
+    ///
+    /// If precomputation fails, the `ErrorCode` is returned as an `Err`. Among the reasons
+    /// for precomputation to fail are the following:
+    ///
+    /// * `NoRules`: The grammar has no rules.
+    /// * `NoStartSymbol`: No start symbol was specified.
+    /// * `InvalidStartSymbol`: A start symbol ID was specified,
+    ///   but it is not the ID of a valid symbol.
+    /// * `StartNotLhs`: The start symbol is not on the LHS of any rule.
+    /// * `UnproductiveStart`: The start symbol is not productive.
+    /// * `CountedNullable`: A symbol on the RHS of a sequence rule is
+    ///   nullable. Libmarpa does not allow this.
+    /// * `NullingTerminal`: A terminal is also a nulling symbol.
+    ///   Libmarpa does not allow this.
+    pub fn precompute(&mut self) -> Result<(), ErrorCode> {
         unsafe {
-            ffi::marpa_g_precompute(self.grammar);
+            if ffi::marpa_g_precompute(self.grammar) >= 0 {
+                Ok(())
+            } else {
+                Err(ffi::marpa_g_error(self.grammar, ptr::null()))
+            }
         }
     }
 
+    /// Determines if the grammar is precomputed.
     pub fn is_precomputed(&self) -> bool {
         unsafe {
             ffi::marpa_g_is_precomputed(self.grammar) == 1
@@ -93,8 +131,7 @@ impl<'a> Grammar<'a> {
     }
 }
 
-#[unsafe_destructor]
-impl<'a> Drop for Grammar<'a> {
+impl Drop for Grammar {
     fn drop(&mut self) {
         unsafe {
             ffi::marpa_g_unref(self.grammar);
@@ -107,7 +144,9 @@ pub struct Recognizer {
 }
 
 impl Recognizer {
-    pub fn new(grammar: &Grammar) -> Option<Recognizer> {
+    /// Constructs a new recognizer. Returns `None` if `grammar` is not precomputed, or on other
+    /// failure.
+    pub fn new(grammar: &mut Grammar) -> Option<Recognizer> {
         let recce_ptr = unsafe {
             ffi::marpa_r_new(grammar.grammar)
         };
@@ -118,27 +157,31 @@ impl Recognizer {
         }
     }
 
-    pub fn start_input(&self) -> bool {
+    /// Makes the recognizer ready for input. Returns `true` on success.
+    pub fn start_input(&mut self) -> bool {
         unsafe {
             ffi::marpa_r_start_input(self.recce) >= 0
         }
     }
 
-    pub fn alternative(&self, token_id: Symbol, value: i32, length: i32) {
+    pub fn alternative(&mut self, token_id: Symbol, value: i32, length: i32) -> ErrorCode {
+        debug_assert!(value != 0);
         // TODO: return value
         unsafe {
-            ffi::marpa_r_alternative(self.recce, token_id.id, value, length);
+            ffi::marpa_r_alternative(self.recce, token_id.id, value, length)
         }
     }
 
-    /// An exhausted parse may cause a failure.
-    pub fn earleme_complete(&self) -> Option<Earleme> {
+    /// Finalizes processing of the current earleme. An exhausted parse may cause a failure.
+    pub fn earleme_complete(&mut self) -> Option<Earleme> {
         Earleme::new(unsafe {
             ffi::marpa_r_earleme_complete(self.recce)
         })
     }
 
+    /// Returns the latest Earley set.
     pub fn latest_earley_set(&self) -> EarleySet {
+        // always succeeds
         EarleySet::new(unsafe {
             ffi::marpa_r_latest_earley_set(self.recce)
         }).unwrap()
@@ -158,7 +201,8 @@ pub struct Bocage {
 }
 
 impl Bocage {
-    pub fn new(recce: &Recognizer, earley_set: EarleySet) -> Option<Bocage> {
+    /// Constructs a new bocage. Returns `None` on failure.
+    pub fn new(recce: &mut Recognizer, earley_set: EarleySet) -> Option<Bocage> {
         let bocage_ptr = unsafe {
             ffi::marpa_b_new(recce.recce, earley_set.id)
         };
@@ -183,7 +227,8 @@ pub struct Order {
 }
 
 impl Order {
-    pub fn new(bocage: &Bocage) -> Option<Order> {
+    /// Constructs a new order. Returns `None` on failure.
+    pub fn new(bocage: &mut Bocage) -> Option<Order> {
         let order_ptr = unsafe {
             ffi::marpa_o_new(bocage.bocage)
         };
@@ -208,7 +253,7 @@ pub struct Tree {
 }
 
 impl Tree {
-    pub fn new(order: &Order) -> Option<Tree> {
+    pub fn new(order: &mut Order) -> Option<Tree> {
         let tree_ptr = unsafe {
             ffi::marpa_t_new(order.order)
         };
@@ -219,13 +264,13 @@ impl Tree {
         }
     }
 
-    pub fn next(&self) -> i32 {
+    pub fn next(&mut self) -> i32 {
         unsafe {
             ffi::marpa_t_next(self.tree)
         }
     }
 
-    pub fn values(&self) -> Values {
+    pub fn values(&mut self) -> Values {
         Values {
             tree: self,
         }
@@ -245,7 +290,7 @@ pub struct Value {
 }
 
 impl Value {
-    pub fn new(tree: &Tree) -> Option<Value> {
+    pub fn new(tree: &mut Tree) -> Option<Value> {
         let val_ptr = unsafe {
             ffi::marpa_v_new(tree.tree)
         };
@@ -256,19 +301,19 @@ impl Value {
         }
     }
 
-    pub fn step(&self) -> ffi::Step {
+    pub fn step(&mut self) -> ffi::Step {
         unsafe {
             ffi::marpa_v_step(self.value)
         }
     }
 
-    pub fn rule_is_valued_set(&self, rule: Rule, n: i32) {
+    pub fn rule_is_valued_set(&mut self, rule: Rule, n: i32) {
         unsafe {
             ffi::marpa_v_rule_is_valued_set(self.value, rule.id, n);
         }
     }
 
-    pub fn symbol_is_valued_set(&self, sym: Symbol, n: i32) {
+    pub fn symbol_is_valued_set(&mut self, sym: Symbol, n: i32) {
         unsafe {
             ffi::marpa_v_symbol_is_valued_set(self.value, sym.id, n);
         }
@@ -306,7 +351,7 @@ impl Drop for Value {
 }
 
 pub struct Values<'a> {
-    tree: &'a Tree,
+    tree: &'a mut Tree,
 }
 
 impl<'a> Iterator<Value> for Values<'a> {
