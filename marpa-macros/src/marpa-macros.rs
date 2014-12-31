@@ -22,6 +22,7 @@ use syntax::ext::build::AstBuilder;
 
 use std::collections::HashSet;
 use std::collections::HashMap;
+use std::iter::DoubleEndedIteratorExt;
 use std::mem;
 
 #[plugin_registrar]
@@ -187,7 +188,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     let scan_syms = l0_rules.iter().map(|&(l0_sym_id, _)| l0_sym_id).collect::<Vec<_>>();
     let ast::Name(scan_syms_0) = scan_syms[0];
     let num_scan_syms = l0_rules.len();
-    let reg_alt = format!("({})", reg_alt);
+    let reg_alt_s = format!("({})", reg_alt);
+    let reg_alt = reg_alt_s.as_slice();
 
     // ``` let scan_syms = [syms[$l0_sym_id0], syms[$l0_sym_id1], ...]; ```
     let scan_syms_exprs = l0_rules.iter().map(|&(ast::Name(l0_sym_id), _)| quote_expr!(cx, syms[$l0_sym_id as uint])).collect::<Vec<_>>();
@@ -228,67 +230,127 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                           quote_ty!(cx, [(::marpa::Symbol, &[::marpa::Symbol]), ..$num_rules]),
                           rules_expr);
 
-    let g_expr = quote_expr!(cx,
-        {
-            let mut cfg = ::marpa::Config::new();
-            let grammar = ::marpa::Grammar::with_config(&mut cfg).unwrap();
-            let mut syms: [::marpa::Symbol, ..$num_syms] = unsafe { ::std::mem::uninitialized() };
-            for sym in syms.iter_mut() { *sym = grammar.symbol_new().unwrap(); }
-            grammar.start_symbol_set(syms[0]);
-            $let_rules_stmt
-            $let_scan_syms_stmt
-            let mut rule_ids: [::marpa::Rule, ..$num_rules] = unsafe { ::std::mem::uninitialized() };
-            for (&(lhs, rhs), id) in rules.iter().zip(rule_ids.iter_mut()) {
-                *id = grammar.rule_new(lhs, rhs).unwrap();
+    // ``` if rule == self.rule_ids[$x] { let arg = &self.stack[arg_0]; {$block} } ```
+    let rule_exprs = range(0u, num_rules);
+    let mut rule_cond_expr = quote_expr!(cx, panic!("unknown rule"));
+    for _rule_expr in rule_exprs.rev() {
+        // let then_expr = 
+        rule_cond_expr = cx.expr_if(sp, quote_expr!(cx, rule == self.rule_ids[$_rule_expr]),
+                                        quote_expr!(cx,
+                                            self.rule_closures[$_rule_expr]()/*self.stack.slice(arg_0, arg_n+1)*/
+                                        ),
+                                        Some(rule_cond_expr));
+    }
+
+    let fn_new_expr = quote_expr!(cx, {
+        let mut cfg = ::marpa::Config::new();
+        let mut grammar = ::marpa::Grammar::with_config(&mut cfg).unwrap();
+        let mut syms: [::marpa::Symbol, ..$num_syms] = unsafe { ::std::mem::uninitialized() };
+        for sym in syms.iter_mut() { *sym = grammar.symbol_new().unwrap(); }
+        grammar.start_symbol_set(syms[0]);
+        $let_rules_stmt
+        $let_scan_syms_stmt
+        let mut rule_ids: [::marpa::Rule, ..$num_rules] = unsafe { ::std::mem::uninitialized() };
+        for (&(lhs, rhs), id) in rules.iter().zip(rule_ids.iter_mut()) {
+            *id = grammar.rule_new(lhs, rhs).unwrap();
+        }
+        grammar.precompute();
+
+        let scanner = regex!($reg_alt);
+        (grammar, scan_syms, rule_ids, scanner)
+    });
+
+    let fn_parse_expr = quote_expr!(cx, {
+        let mut recce = ::marpa::Recognizer::new(&mut self.grammar).unwrap();
+        recce.start_input();
+
+        // let mut stack: Vec<T> = vec![];
+
+        // let scanner = regex!($reg_alt);
+        for capture in self.scanner.captures_iter(input) {
+            let pos = capture.iter().skip(1).position(|s| !s.is_empty()).unwrap();
+            recce.alternative(self.scan_syms[pos], 1i32, 1);
+            recce.earleme_complete();
+        }
+
+        let latest_es = recce.latest_earley_set();
+        let mut bocage = ::marpa::Bocage::new(&mut recce, latest_es).unwrap();
+        let mut order = ::marpa::Order::new(&mut bocage).unwrap();
+        let mut tree = ::marpa::Tree::new(&mut order).unwrap();
+
+        for mut valuator in tree.values() {
+            for &rule in self.rule_ids.iter() {
+                valuator.rule_is_valued_set(rule, 1);
             }
-            grammar.precompute();
 
-            let recce = ::marpa::Recognizer::new(&grammar).unwrap();
-            recce.start_input();
-
-            let scanner = regex!($reg_alt);
-
-            move |: input: &str| {
-                for capture in scanner.captures_iter(input) {
-                    let pos = capture.iter().skip(1).position(|s| !s.is_empty()).unwrap();
-                    recce.alternative(scan_syms[pos], 1i32, 1);
-                    recce.earleme_complete();
-                }
-
-                let latest_es = recce.latest_earley_set();
-                let bocage = ::marpa::Bocage::new(&recce, latest_es).unwrap();
-                let order = ::marpa::Order::new(&bocage).unwrap();
-                let tree = ::marpa::Tree::new(&order).unwrap();
-
-                for valuator in tree.values() {
-                    for &rule in rule_ids.iter() {
-                        valuator.rule_is_valued_set(rule, 1);
+            loop {
+                use marpa::Step;
+                let (i, el) = match valuator.step() {
+                    Step::StepToken => {
+                        let tok_idx = valuator.token_value() as uint;
+                        (valuator.result() as uint,
+                         self.rule_closures[1]()) // ?
                     }
-
-                    loop {
-                        use marpa::Step;
-                        match valuator.step() {
-                            Step::StepToken => {
-                                let tok_idx = valuator.token_value() as uint;
-                                println!("tok {}", tok_idx);
-                            }
-                            Step::StepRule => {
-                                let arg_0 = valuator.arg_0();
-                                let arg_n = valuator.arg_n();
-                                let rule = valuator.rule();
-                                println!("rule {} {}", arg_0, arg_n);
-                            }
-                            Step::StepInactive | Step::StepNullingSymbol => {
-                                println!("step");
-                                break;
-                            }
-                            other => panic!("unexpected step {}", other),
-                        }
+                    Step::StepRule => {
+                        let rule = valuator.rule();
+                        let arg_0 = valuator.arg_0() as uint;
+                        let arg_n = valuator.arg_n() as uint;
+                        let elem = $rule_cond_expr;
+                        // println!("rule {} {} => {}", arg_0, arg_n, elem);
+                        (arg_0, elem)
                     }
+                    Step::StepInactive | Step::StepNullingSymbol => {
+                        // println!("step");
+                        break;
+                    }
+                    other => panic!("unexpected step {}", other),
+                };
+
+                if i == self.stack.len() {
+                    self.stack.push(el);
+                } else {
+                    self.stack[i] = el;
                 }
             }
         }
-    );
+        let result = self.stack.swap_remove(0).unwrap();
+        self.stack.clear();
+        result
+    });
 
-    MacExpr::new(g_expr)
+    let slif_expr = quote_expr!(cx, {
+        struct SlifGrammar<T> {
+            grammar: ::marpa::Grammar,
+            stack: Vec<T>,
+            scan_syms: [::marpa::Symbol; $num_scan_syms],
+            rule_ids: [::marpa::Rule; $num_rules],
+            scanner: ::regex::Regex,
+            rule_closures: [fn() -> T; $num_rules],
+        }
+        impl<T> SlifGrammar<T> {
+            #[inline]
+            fn new(rule_closures: [fn() -> T; $num_rules]) -> SlifGrammar<T> {
+                let (grammar, ssym, rid, scanner) = $fn_new_expr;
+                SlifGrammar {
+                    grammar: grammar,
+                    stack: vec![],
+                    scan_syms: ssym,
+                    rule_ids: rid,
+                    scanner: scanner,
+                    rule_closures: rule_closures,
+                }
+            }
+            #[inline]
+            fn parse(&mut self, input: &str) -> T {
+                $fn_parse_expr
+            }
+        }
+        fn f1() -> uint { 12u }
+        fn f2() -> uint { 34u }
+        fn f3() -> uint { 45u }
+        let ary = [f1 as fn()->uint, f2 as fn()->uint, f3 as fn()->uint];
+        SlifGrammar::new(ary)
+    });
+
+    MacExpr::new(slif_expr)
 }

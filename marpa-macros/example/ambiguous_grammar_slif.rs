@@ -1,5 +1,5 @@
 // #![crate_type = "bin"]
-#![feature(phase, overloaded_calls)]
+#![feature(phase, unboxed_closures)]
 
 #[phase(plugin, link)]
 extern crate "marpa-macros" as marpa_macros;
@@ -11,10 +11,10 @@ extern crate regex;
 extern crate regex_macros;
 
 fn main() {
-    let g = grammar! {
+    let mut simple = grammar! {
         expr ::= expr op expr | number ;
         number ~ r"\d" ;
         op ~ r"[-+*/]" ;
     };
-    g("2 - 0 * 3 + 1");
+    let x: uint = simple.parse("2 - 0 * 3 + 1");
 }
