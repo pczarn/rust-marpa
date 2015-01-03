@@ -47,11 +47,36 @@ enum RuleRhs {
     Alternative(Vec<RuleRhs>),
     Sequence(Vec<RuleRhs>, Option<P<ast::Block>>),
     Ident(ast::Name),
-    Repeat(ast::Name, KleeneOp),
+    Repeat(Box<RuleRhs>, KleeneOp),
     Lexeme(token::InternedString, Option<P<ast::Block>>),
 }
 
 impl RuleRhs {
+    fn extract_sub_rules(&mut self, syms: &mut StrInterner, cont: &mut Vec<Rule>) {
+        match self {
+            &Lexeme(_, None) => {
+                let new_sym = syms.gensym("");
+                let lex = mem::replace(self, Ident(new_sym));
+                cont.push(rule!(new_sym ::= lex));
+            }
+            &Repeat(box ref mut sub_rule, op) => match sub_rule {
+                &Ident(..) => {},
+                other_sub_rule => {
+                    other_sub_rule.extract_sub_rules(syms, cont);
+                    let new_sym = syms.gensym("");
+                    let other = mem::replace(other_sub_rule, Ident(new_sym));
+                    cont.push(rule!(new_sym ::= other));
+                }
+            },
+            &Sequence(ref mut seq, _) | &Alternative(ref mut seq) => {
+                for rule in seq.iter_mut() {
+                    rule.extract_sub_rules(syms, cont);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn create_seq_rules(&mut self, syms: &mut StrInterner, cont: &mut Vec<Rule>) {
         match self {
             &Sequence(ref mut seq, _) | &Alternative(ref mut seq) => {
@@ -59,19 +84,19 @@ impl RuleRhs {
                     rule.create_seq_rules(syms, cont);
                 }
             }
-            &Repeat(repeated, op) => {
+            &Repeat(box ref mut repeated, op) => {
                 let new_sym = syms.gensym("");
-                let rule = mem::replace(self, Ident(new_sym));
+                let repeated = mem::replace(repeated, Ident(new_sym));
                 match op {
                     ZeroOrMore => {
                         cont.push(rule!(new_sym ::= Sequence(vec![], None)));
                     }
                     OneOrMore => {
-                        cont.push(rule!(new_sym ::= Ident(repeated.clone())));
+                        cont.push(rule!(new_sym ::= repeated.clone()));
                     }
                 }
                 cont.push(rule!(
-                    new_sym ::= Sequence(vec![Ident(new_sym), Ident(repeated)], None)
+                    new_sym ::= Sequence(vec![Ident(new_sym), repeated], None)
                 ));
             }
             &Ident(..) | &Lexeme(..) => {}
@@ -93,6 +118,10 @@ impl RuleRhs {
 impl Rule {
     fn ident(left: ast::Name, right: ast::Name) -> Rule {
         Rule { name: left, rhs: Ident(right) }
+    }
+
+    fn extract_sub_rules(&mut self, syms: &mut StrInterner, cont: &mut Vec<Rule>) {
+        self.rhs.extract_sub_rules(syms, cont);
     }
 
     fn create_seq_rules(&mut self, syms: &mut StrInterner, cont: &mut Vec<Rule>) {
@@ -146,11 +175,11 @@ fn parse_name_or_repeat(parser: &mut Parser, syms: &mut StrInterner) -> RuleRhs 
         let elem = match parser.token {
             token::BinOp(token::Star) => {
                 parser.bump();
-                Repeat(new_name, ZeroOrMore)
+                Repeat(box Ident(new_name), ZeroOrMore)
             }
             token::BinOp(token::Plus) => {
                 parser.bump();
-                Repeat(new_name, OneOrMore)
+                Repeat(box Ident(new_name), OneOrMore)
             }
             _ => Ident(new_name),
         };
@@ -242,6 +271,12 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     }
 
     // prepare grammar rules
+
+    let mut g1_extracted_rules = vec![];
+    for rule in g1_rules.iter_mut() {
+        rule.extract_sub_rules(&mut g1_syms, &mut g1_extracted_rules);
+    }
+    g1_rules.extend(g1_extracted_rules.into_iter());
 
     let mut g1_rules_cont = vec![];
     for rule in g1_rules.into_iter() {
@@ -408,7 +443,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         let mut order = ::marpa::Order::new(&mut bocage).unwrap();
         let mut tree = ::marpa::Tree::new(&mut order).unwrap();
 
-        SlifIter {
+        SlifParse {
             tree: tree,
             positions: positions,
             input: input,
@@ -481,7 +516,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             rules_closure: C,
             lex_closure: D,
         }
-        struct SlifIter<'a, 'b, 'l, T, C: 'b, D: 'b> {
+        struct SlifParse<'a, 'b, 'l, T, C: 'b, D: 'b> {
             tree: Tree,
             positions: Vec<(uint, uint)>,
             input: &'a str,
@@ -505,11 +540,11 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 }
             }
             #[inline]
-            fn parse<'b, 'c, 'l>(&'c mut self, input: &'b str) -> SlifIter<'b, 'c, 'l, T, C, D> {
+            fn parse<'b, 'c>(&'c mut self, input: &'b str) -> SlifParse<'b, 'c, 'a, T, C, D> {
                 $fn_parse_expr
             }
         }
-        impl<'a, 'b, 'l, T, C, D> Iterator<T> for SlifIter<'a, 'b, 'l, T, C, D>
+        impl<'a, 'b, 'l, T, C, D> Iterator<T> for SlifParse<'a, 'b, 'l, T, C, D>
                 where C: Fn(&[T], Rule, &[Rule; $num_rules]) -> T,
                       D: Fn(&str, uint) -> T {
             fn next(&mut self) -> Option<T> {
