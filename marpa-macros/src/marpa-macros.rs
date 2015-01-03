@@ -104,7 +104,6 @@ impl Rule {
         let reg_alt = rules.iter().filter_map(|rule|
             match &rule.rhs {
                 &Lexeme(ref s, _) => {
-                    println!("{}", rule.name.as_str());
                     if &*syms.get(rule.name) == "discard" {
                         alts.push(s.get().into_string());
                         None
@@ -409,64 +408,86 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         let mut order = ::marpa::Order::new(&mut bocage).unwrap();
         let mut tree = ::marpa::Tree::new(&mut order).unwrap();
 
-        for mut valuator in tree.values() {
-            for &rule in self.rule_ids.iter() {
-                valuator.rule_is_valued_set(rule, 1);
-            }
+        SlifIter {
+            tree: tree,
+            positions: positions,
+            input: input,
+            stack: vec![],
+            parent: self,
+        }
+    });
 
-            loop {
-                use marpa::Step;
-                let (i, el) = match valuator.step() {
-                    Step::StepToken => {
-                        let start_pos = valuator.token_value() as uint - 1;
-                        let (end_pos, tok_kind) = if start_pos == 0 {
-                            positions[0]
-                        } else {
-                            positions[positions.binary_search_by(|&(el, _)| el.cmp(&start_pos)).err().expect("binary search panicked")]
-                        };
-                        (valuator.result() as uint,
-                         self.lex_closure.call((input.slice(start_pos, end_pos), tok_kind)))
-                    }
-                    Step::StepRule => {
-                        let rule = valuator.rule();
-                        let arg_0 = valuator.arg_0() as uint;
-                        let arg_n = valuator.arg_n() as uint;
-                        let elem = self.rules_closure.call((self.stack.slice(arg_0, arg_n + 1), rule, &self.rule_ids));
-                        // println!("rule {} {} => {}", arg_0, arg_n, elem);
-                        (arg_0, elem)
-                    }
-                    Step::StepInactive | Step::StepNullingSymbol => {
-                        break;
-                    }
-                    other => panic!("unexpected step {}", other),
-                };
+    let slif_iter_next_expr = quote_expr!(cx, {
+        let mut valuator = if self.tree.next() >= 0 {
+            Value::new(&mut self.tree).unwrap()
+        } else {
+            return None;
+        };
+        for &rule in self.parent.rule_ids.iter() {
+            valuator.rule_is_valued_set(rule, 1);
+        }
 
-                if i == self.stack.len() {
-                    self.stack.push(el);
-                } else {
-                    self.stack[i] = el;
+        loop {
+            let (i, el) = match valuator.step() {
+                Step::StepToken => {
+                    let start_pos = valuator.token_value() as uint - 1;
+                    let (end_pos, tok_kind) = if start_pos == 0 {
+                        self.positions[0]
+                    } else {
+                        self.positions[self.positions.binary_search_by(|&(el, _)| el.cmp(&start_pos)).err().expect("binary search panicked")]
+                    };
+                    (valuator.result() as uint,
+                     self.parent.lex_closure.call((self.input.slice(start_pos, end_pos), tok_kind)))
                 }
+                Step::StepRule => {
+                    let rule = valuator.rule();
+                    let arg_0 = valuator.arg_0() as uint;
+                    let arg_n = valuator.arg_n() as uint;
+                    let elem = self.parent.rules_closure.call((self.stack.slice(arg_0, arg_n + 1), rule, &self.parent.rule_ids));
+                    // println!("rule {} {} => {}", arg_0, arg_n, elem);
+                    (arg_0, elem)
+                }
+                Step::StepInactive | Step::StepNullingSymbol => {
+                    break;
+                }
+                other => panic!("unexpected step {}", other),
+            };
+
+            if i == self.stack.len() {
+                self.stack.push(el);
+            } else {
+                self.stack[i] = el;
             }
         }
+
         let result = self.stack.swap_remove(0);
         self.stack.clear();
-        result
+        Some(result)
     });
 
     let slif_expr = quote_expr!(cx, {
-        use marpa::{Rule, Symbol};
+        use std::iter::{Map, Iterator};
+        use marpa::{Tree, Rule, Symbol, Value, Step};
+        use marpa::marpa::Values;
         // enum InternalRepr<'a, T> {
         //     A(T),
         //     B(&'a str),
         // }
         struct SlifGrammar<'a, T, C, D> {
             grammar: ::marpa::Grammar,
-            stack: Vec<T>,
             scan_syms: [Symbol; $num_scan_syms],
             rule_ids: [Rule; $num_rules],
             scanner: ::regex::Regex,
             rules_closure: C,
             lex_closure: D,
+        }
+        struct SlifIter<'a, 'b, 'l, T, C: 'b, D: 'b> {
+            tree: Tree,
+            positions: Vec<(uint, uint)>,
+            input: &'a str,
+            stack: Vec<T>,
+            parent: &'b SlifGrammar<'l, T, C, D>,
+
         }
         impl<'a, T, C, D> SlifGrammar<'a, T, C, D>
                 where C: Fn(&[T], Rule, &[Rule; $num_rules]) -> T,
@@ -476,7 +497,6 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 let (grammar, ssym, rid, scanner) = $fn_new_expr;
                 SlifGrammar {
                     grammar: grammar,
-                    stack: vec![],
                     scan_syms: ssym,
                     rule_ids: rid,
                     scanner: scanner,
@@ -485,8 +505,15 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 }
             }
             #[inline]
-            fn parse(&mut self, input: &str) -> T {
+            fn parse<'b, 'c, 'l>(&'c mut self, input: &'b str) -> SlifIter<'b, 'c, 'l, T, C, D> {
                 $fn_parse_expr
+            }
+        }
+        impl<'a, 'b, 'l, T, C, D> Iterator<T> for SlifIter<'a, 'b, 'l, T, C, D>
+                where C: Fn(&[T], Rule, &[Rule; $num_rules]) -> T,
+                      D: Fn(&str, uint) -> T {
+            fn next(&mut self) -> Option<T> {
+                $slif_iter_next_expr
             }
         }
         SlifGrammar::new(|&: args, rule, rules| {

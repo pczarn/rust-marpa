@@ -31,6 +31,7 @@ fn main() {
         op ~ r"[-+*/]" ;
         discard ~ r"\s" ;
     };
-    let x: uint = simple.parse("2 - 0 * 3 + 1");
-    println!("{}", x);
+    for x in simple.parse("2 - 0 * 3 + 1") {
+        println!("{}", x);
+    }
 }
