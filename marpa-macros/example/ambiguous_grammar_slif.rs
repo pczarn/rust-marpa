@@ -12,9 +12,10 @@ extern crate regex_macros;
 
 fn main() {
     let mut simple = grammar! {
-        expr ::= expr op expr | number ;
+        expr ::= expr op expr { 1u } | number { 2u } ;
         number ~ r"\d" ;
         op ~ r"[-+*/]" ;
     };
     let x: uint = simple.parse("2 - 0 * 3 + 1");
+    println!("{}", x);
 }
