@@ -7,7 +7,7 @@ extern crate syntax;
 
 use self::RuleRhs::*;
 use self::KleeneOp::*;
-use self::ParsedRule::*;
+use self::ParsedSlifRule::*;
 
 use syntax::ast;
 use syntax::ast::TokenTree;
@@ -48,7 +48,7 @@ enum RuleRhs {
     Sequence(Vec<RuleRhs>, Option<P<ast::Block>>),
     Ident(ast::Name),
     Repeat(ast::Name, KleeneOp),
-    Lexeme(token::InternedString),
+    Lexeme(token::InternedString, Option<P<ast::Block>>),
 }
 
 impl RuleRhs {
@@ -99,15 +99,25 @@ impl Rule {
         self.rhs.create_seq_rules(syms, cont);
     }
 
-    fn l0(rules: &[Rule]) -> String {
-        let reg_alt = rules.iter().map(|rule|
+    fn l0(rules: &[Rule], syms: &StrInterner) -> String {
+        let mut alts = vec![];
+        let reg_alt = rules.iter().filter_map(|rule|
             match &rule.rhs {
-                &Lexeme(ref s) => s.get().into_string(),
+                &Lexeme(ref s, _) => {
+                    println!("{}", rule.name.as_str());
+                    if &*syms.get(rule.name) == "discard" {
+                        alts.push(s.get().into_string());
+                        None
+                    } else {
+                        Some(s.get() .into_string())
+                    }
+                }
                 _ => unreachable!()
             }
-        ).collect::<Vec<_>>().connect(")|(");
+        ).collect::<Vec<_>>();
 
-        format!("({})", reg_alt)
+        alts.push(format!("({})", reg_alt.connect(")|(")));
+        alts.connect("|")
     }
 }
 
@@ -122,7 +132,7 @@ struct Rule {
     rhs: RuleRhs,
 }
 
-enum ParsedRule {
+enum ParsedSlifRule {
     L0Rule(Rule),
     G1Rule(Rule),
 }
@@ -179,18 +189,24 @@ fn parse_rhs(parser: &mut Parser, syms: &mut StrInterner) -> RuleRhs {
     }
 }
 
-fn parse_rule(parser: &mut Parser, syms: &mut StrInterner) -> Option<ParsedRule> {
+fn parse_rule(parser: &mut Parser, syms: &mut StrInterner) -> Option<ParsedSlifRule> {
     let ident = parser.parse_ident();
     let new_name = syms.intern(ident.as_str());
 
     if parser.token == token::Tilde {
         parser.bump();
         let (regex_str, _str_style) = parser.parse_str();
+        // TODO move this
+        let blk = if parser.token == token::OpenDelim(token::Brace) {
+            Some(parser.parse_block())
+        } else {
+            None
+        };
         parser.expect(&token::Semi);
 
         Some(L0Rule(Rule {
             name: new_name,
-            rhs: Lexeme(regex_str),
+            rhs: Lexeme(regex_str, blk),
         }))
     } else if parser.token == token::ModSep && parser.look_ahead(1, |t| *t == token::Eq) {
         parser.bump();
@@ -253,11 +269,31 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
     // LEXER -- L0
     let scan_syms = l0_rules.iter().map(|rule| rule.name).collect::<Vec<_>>();
-    let ast::Name(scan_syms_0) = scan_syms[0];
     let num_scan_syms = l0_rules.len();
+    let l0_inline_actions = l0_rules.iter().map(|rule|
+        match &rule.rhs {
+            &Lexeme(ref s, ref rblk) => {
+                rblk.clone().map(|b| cx.expr_block(b)).unwrap_or(quote_expr!(cx, {7u}))
+            }
+            _ => panic!()
+        }
+    ).collect::<Vec<_>>();
 
-    let reg_alt_s = Rule::l0(l0_rules.as_slice());
+    let reg_alt_s = Rule::l0(l0_rules.as_slice(), &g1_syms);
     let reg_alt = reg_alt_s.as_slice();
+
+    // ``` if tok_kind == 0 { $block } ```
+    let rule_blk_call_exprs = range(0u, num_scan_syms);
+    let mut lex_cond_expr = quote_expr!(cx, panic!("unknown rule"));
+    for (n, nth_rule_expr) in l0_inline_actions.iter().enumerate().rev() {
+        // let then_expr = 
+        lex_cond_expr = cx.expr_if(sp, quote_expr!(cx, tok_kind == $n),
+                                        quote_expr!(cx,
+                                            // let $args_pat = args;
+                                            $nth_rule_expr
+                                        ),
+                                        Some(lex_cond_expr));
+    }
 
     // ``` let scan_syms = [syms[$l0_sym_id0], syms[$l0_sym_id1], ...]; ```
     let scan_syms_exprs = l0_rules.iter().map(|rule| {
@@ -269,7 +305,6 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
     // RULES -- G1
     let mut rhs_exprs = vec![];
-    // let mut rhs_exprs = vec![];
     let rules =
     g1_rules_cont.iter().chain(g1_seq_rules.iter()).map(|rule| {
         let rblk = match &rule.rhs {
@@ -288,7 +323,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             &Ident(rhs_sym) => {
                 let rhs_sym = rhs_sym.uint();
                 rhs_exprs.push(quote_expr!(cx, syms[$rhs_sym]));
-                quote_expr!(cx, {7u})
+                quote_expr!(cx, { args[0] })
             }
             _ => panic!()
         };
@@ -299,7 +334,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 quote_expr!(cx, syms[$lhs]),
                 cx.expr_vec_slice(sp, mem::replace(&mut rhs_exprs, vec![])),
             ]),
-            quote_expr!(cx, box()(|&:| $rblk))
+            // quote_expr!(cx, box()(|&: args| $rblk))
+            rblk
         );
     });
     let (rule_exprs, rule_blk_exprs) = vec::unzip(rules);
@@ -307,7 +343,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     // ``` let rules = &[$rule_exprs]; ```
     let num_rules = rule_exprs.len();
     let rules_expr = cx.expr_vec(sp, rule_exprs);
-    let rule_closures_expr = cx.expr_vec(sp, rule_blk_exprs);
+    // let rule_closures_expr = cx.expr_vec(sp, rule_blk_exprs);
     let let_rules_stmt =
         cx.stmt_let_typed(sp,
                           false,
@@ -315,17 +351,20 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                           quote_ty!(cx, [(::marpa::Symbol, &[::marpa::Symbol]); $num_rules]),
                           rules_expr);
 
-    // ``` if rule == self.rule_ids[$x] { let arg = &self.stack[arg_0]; {$block} } ```
+    // ``` if rule == self.rule_ids[$x] { $block } ```
     let rule_blk_call_exprs = range(0u, num_rules);
     let mut rule_cond_expr = quote_expr!(cx, panic!("unknown rule"));
-    for _rule_expr in rule_blk_call_exprs.rev() {
+    for (n, nth_rule_expr) in rule_blk_exprs.iter().enumerate().rev() {
         // let then_expr = 
-        rule_cond_expr = cx.expr_if(sp, quote_expr!(cx, rule == self.rule_ids[$_rule_expr]),
+        rule_cond_expr = cx.expr_if(sp, quote_expr!(cx, rule == rules[$n]),
                                         quote_expr!(cx,
-                                            self.rule_closures[$_rule_expr].call(())/*self.stack.slice(arg_0, arg_n+1)*/
+                                            // let $args_pat = args;
+                                            $nth_rule_expr
                                         ),
                                         Some(rule_cond_expr));
     }
+
+    // Generated code
 
     let fn_new_expr = quote_expr!(cx, {
         let mut cfg = ::marpa::Config::new();
@@ -352,9 +391,16 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         // let mut stack: Vec<T> = vec![];
 
         // let scanner = regex!($reg_alt);
+        let mut positions = vec![];
+
         for capture in self.scanner.captures_iter(input) {
-            let pos = capture.iter().skip(1).position(|s| !s.is_empty()).unwrap();
-            recce.alternative(self.scan_syms[pos], 1i32, 1);
+            let pos = match capture.iter().skip(1).position(|s| !s.is_empty()) {
+                Some(pos) => pos,
+                _ => continue
+            };
+            let (start_pos, end_pos) = capture.pos(pos + 1).expect("pos panicked");
+            positions.push((end_pos, pos));
+            recce.alternative(self.scan_syms[pos], (start_pos + 1) as i32, 1); // 0 is reserved
             recce.earleme_complete();
         }
 
@@ -372,20 +418,24 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 use marpa::Step;
                 let (i, el) = match valuator.step() {
                     Step::StepToken => {
-                        let tok_idx = valuator.token_value() as uint;
+                        let start_pos = valuator.token_value() as uint - 1;
+                        let (end_pos, tok_kind) = if start_pos == 0 {
+                            positions[0]
+                        } else {
+                            positions[positions.binary_search_by(|&(el, _)| el.cmp(&start_pos)).err().expect("binary search panicked")]
+                        };
                         (valuator.result() as uint,
-                         self.rule_closures[1].call(())) // ?
+                         self.lex_closure.call((input.slice(start_pos, end_pos), tok_kind)))
                     }
                     Step::StepRule => {
                         let rule = valuator.rule();
                         let arg_0 = valuator.arg_0() as uint;
                         let arg_n = valuator.arg_n() as uint;
-                        let elem = $rule_cond_expr;
+                        let elem = self.rules_closure.call((self.stack.slice(arg_0, arg_n + 1), rule, &self.rule_ids));
                         // println!("rule {} {} => {}", arg_0, arg_n, elem);
                         (arg_0, elem)
                     }
                     Step::StepInactive | Step::StepNullingSymbol => {
-                        // println!("step");
                         break;
                     }
                     other => panic!("unexpected step {}", other),
@@ -404,17 +454,25 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     });
 
     let slif_expr = quote_expr!(cx, {
-        struct SlifGrammar<T> {
+        use marpa::{Rule, Symbol};
+        // enum InternalRepr<'a, T> {
+        //     A(T),
+        //     B(&'a str),
+        // }
+        struct SlifGrammar<'a, T, C, D> {
             grammar: ::marpa::Grammar,
             stack: Vec<T>,
-            scan_syms: [::marpa::Symbol; $num_scan_syms],
-            rule_ids: [::marpa::Rule; $num_rules],
+            scan_syms: [Symbol; $num_scan_syms],
+            rule_ids: [Rule; $num_rules],
             scanner: ::regex::Regex,
-            rule_closures: [Box<Fn() -> T + 'static>; $num_rules],
+            rules_closure: C,
+            lex_closure: D,
         }
-        impl<T> SlifGrammar<T> {
+        impl<'a, T, C, D> SlifGrammar<'a, T, C, D>
+                where C: Fn(&[T], Rule, &[Rule; $num_rules]) -> T,
+                      D: Fn(&str, uint) -> T {
             #[inline]
-            fn new(rule_closures: [Box<Fn() -> T + 'static>; $num_rules]) -> SlifGrammar<T> {
+            fn new(rules_closure: C, lex_closure: D) -> SlifGrammar<'a, T, C, D> {
                 let (grammar, ssym, rid, scanner) = $fn_new_expr;
                 SlifGrammar {
                     grammar: grammar,
@@ -422,7 +480,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     scan_syms: ssym,
                     rule_ids: rid,
                     scanner: scanner,
-                    rule_closures: rule_closures,
+                    rules_closure: rules_closure,
+                    lex_closure: lex_closure,
                 }
             }
             #[inline]
@@ -430,7 +489,12 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 $fn_parse_expr
             }
         }
-        SlifGrammar::new($rule_closures_expr)
+        SlifGrammar::new(|&: args, rule, rules| {
+            $rule_cond_expr
+        },
+        |&: arg, tok_kind| {
+            $lex_cond_expr
+        })
     });
     // println!("{}", pprust::expr_to_string(&*slif_expr));
 

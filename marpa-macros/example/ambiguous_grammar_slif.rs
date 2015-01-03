@@ -10,11 +10,26 @@ extern crate regex;
 #[phase(plugin, link)]
 extern crate regex_macros;
 
+fn apply(op: &str, l: uint, r: uint) -> uint {
+    match op {
+        "+" => l + r,
+        "-" => l - r,
+        "*" => l * r,
+        "/" => l / r,
+        _ => panic!(),
+    }
+}
+
 fn main() {
+    let n = &1u;
     let mut simple = grammar! {
-        expr ::= expr op expr { 1u } | number { 2u } ;
+        expr ::= expr op expr { *n } | number { 2u } ;
+        // expr ::= expr op:r"[-+*/]" expr { apply(op, l, r) }
+        //         | num:r"\d" { num.parse().unwrap() } ;
+        // expr ::= number { 2u } | l:expr op:op r:expr { match op { "+" => l + r } } ;
         number ~ r"\d" ;
         op ~ r"[-+*/]" ;
+        discard ~ r"\s" ;
     };
     let x: uint = simple.parse("2 - 0 * 3 + 1");
     println!("{}", x);
