@@ -10,7 +10,7 @@ extern crate regex;
 #[phase(plugin, link)]
 extern crate regex_macros;
 
-fn apply(op: &str, l: uint, r: uint) -> uint {
+fn apply(op: &str, l: i32, r: i32) -> i32 {
     match op {
         "+" => l + r,
         "-" => l - r,
@@ -21,17 +21,12 @@ fn apply(op: &str, l: uint, r: uint) -> uint {
 }
 
 fn main() {
-    let n = &1u;
     let mut simple = grammar! {
-        expr ::= expr op expr { *n } | number { 2u } ;
-        // expr ::= expr op:r"[-+*/]" expr { apply(op, l, r) }
-        //         | num:r"\d" { num.parse().unwrap() } ;
-        // expr ::= number { 2u } | l:expr op:op r:expr { match op { "+" => l + r } } ;
-        number ~ r"\d" ;
-        op ~ r"[-+*/]" ;
+        expr ::=  l:expr op:r"[-+*/]" r:expr { apply(op, l, r) }
+                | num:r"\d" { num.parse().unwrap() } ;
         discard ~ r"\s" ;
     };
-    for x in simple.parse("2 - 0 * 3 + 1") {
-        println!("{}", x);
+    for result in simple.parse("2 - 0 * 3 + 1") {
+        println!("{}", result);
     }
 }
