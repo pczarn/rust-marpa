@@ -1,4 +1,3 @@
-// #![crate_type = "bin"]
 #![feature(phase, unboxed_closures)]
 
 #[phase(plugin, link)]

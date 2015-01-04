@@ -12,7 +12,6 @@ use self::InlineActionType::*;
 use syntax::ast;
 use syntax::ast::TokenTree;
 use syntax::codemap::Span;
-// use syntax::ext::base;
 use syntax::ext::base::{ExtCtxt, MacResult, MacExpr};
 use syntax::parse::token;
 use syntax::parse::parser::Parser;
@@ -438,6 +437,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             Ident(rhs_sym, bound_with) => {
                 let rhs_sym = rhs_sym.uint();
                 rhs_exprs.push(quote_expr!(cx, syms[$rhs_sym]));
+                // bad hack incoming. hard to figure this out
                 (Some(InlineAction {
                     block: cx.block_expr(quote_expr!(cx, unsafe { return ::std::ptr::read(&args[0]) })),
                     ty_return: bound_with.as_ref().map(|b| b.ty_param).unwrap_or(Infer),
@@ -455,7 +455,6 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 quote_expr!(cx, syms[$lhs]),
                 cx.expr_vec_slice(sp, mem::replace(&mut rhs_exprs, vec![])),
             ]),
-            // quote_expr!(cx, box()(|&: args| $rblk))
             rblk
         );
     });
@@ -491,8 +490,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 match bind {
                     Some(InlineBind { ty_param: StrSlice, .. }) =>
                         quote_pat!(cx, SlifRepr::ValStrSlice($pat)),
-                    // Some(InlineBind { ty_param: Infer, }) | None =>
-                    _ => quote_pat!(cx, SlifRepr::ValInfer($pat)),
+                    _ =>
+                        quote_pat!(cx, SlifRepr::ValInfer($pat)),
                 }
             }).collect(),
             None,
@@ -535,9 +534,6 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         let mut recce = ::marpa::Recognizer::new(&mut self.grammar).unwrap();
         recce.start_input();
 
-        // let mut stack: Vec<T> = vec![];
-
-        // let scanner = regex!($reg_alt);
         let mut positions = vec![];
 
         for capture in self.scanner.captures_iter(input) {
@@ -582,17 +578,22 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     let (end_pos, tok_kind) = if start_pos == 0 {
                         self.positions[0]
                     } else {
-                        self.positions[self.positions.binary_search_by(|&(el, _)| el.cmp(&start_pos)).err().expect("binary search panicked")]
+                        let end_idx = self.positions.binary_search_by(|&(el, _)| l.cmp(&start_pos))
+                                                    .err()
+                                                    .expect("binary search panicked");
+                        self.positions[end_idx]
                     };
                     (valuator.result() as uint,
-                     self.parent.lex_closure.call((self.input.slice(start_pos, end_pos), tok_kind)))
+                     self.parent.lex_closure.call((self.input.slice(start_pos, end_pos),
+                                                   tok_kind)))
                 }
                 Step::StepRule => {
                     let rule = valuator.rule();
                     let arg_0 = valuator.arg_0() as uint;
                     let arg_n = valuator.arg_n() as uint;
-                    let elem = self.parent.rules_closure.call((self.stack.slice(arg_0, arg_n + 1), rule, &self.parent.rule_ids));
-                    // println!("rule {} {} => {}", arg_0, arg_n, elem);
+                    let elem = self.parent.rules_closure.call((self.stack.slice(arg_0, arg_n + 1),
+                                                              rule,
+                                                              &self.parent.rule_ids));
                     (arg_0, elem)
                 }
                 Step::StepInactive | Step::StepNullingSymbol => {
