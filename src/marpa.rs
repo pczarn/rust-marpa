@@ -354,7 +354,9 @@ pub struct Values<'a> {
     tree: &'a mut Tree,
 }
 
-impl<'a> Iterator<Value> for Values<'a> {
+impl<'a> Iterator for Values<'a> {
+    type Item = Value;
+
     fn next(&mut self) -> Option<Value> {
         if self.tree.next() >= 0 {
             Value::new(self.tree)

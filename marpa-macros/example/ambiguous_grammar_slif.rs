@@ -1,4 +1,4 @@
-#![feature(phase, unboxed_closures)]
+#![feature(phase, unboxed_closures, associated_types)]
 
 #[phase(plugin, link)]
 extern crate "marpa-macros" as marpa_macros;

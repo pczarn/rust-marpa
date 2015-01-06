@@ -22,9 +22,7 @@ use syntax::ext::build::AstBuilder;
 use syntax::print::pprust;
 
 use std::collections::HashSet;
-use std::iter::DoubleEndedIteratorExt;
 use std::mem;
-use std::vec;
 
 #[plugin_registrar]
 pub fn plugin_registrar(reg: &mut ::rustc::plugin::Registry) {
@@ -40,19 +38,19 @@ macro_rules! rule {
     )
 }
 
-#[deriving(Copy, Clone, Show, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Show, Hash, PartialEq, Eq)]
 enum InlineActionType {
     Infer,
     StrSlice,
 }
 
-#[deriving(Clone, Show)]
+#[derive(Clone, Show)]
 struct InlineAction {
     block: P<ast::Block>,
     ty_return: InlineActionType,
 }
 
-#[deriving(Clone, Show)]
+#[derive(Clone, Show)]
 struct InlineBind {
     name: ast::Ident,
     ty_param: InlineActionType,
@@ -76,7 +74,7 @@ impl InlineBind {
     }
 }
 
-#[deriving(Clone, Show)]
+#[derive(Clone, Show)]
 enum RuleRhs {
     Alternative(Vec<RuleRhs>),
     Sequence(Vec<RuleRhs>, Option<InlineAction>),
@@ -96,7 +94,7 @@ impl RuleRhs {
                 let new_sym = syms.gensym("");
                 let ty_pass = StrSlice;
                 reprs.insert(ty_pass);
-                let mut new_bind = None;
+                let new_bind;
 
                 match self {
                     &Lexeme(_, ref mut action, ref mut bind) => {
@@ -105,6 +103,7 @@ impl RuleRhs {
                             ty_return: ty_pass,
                         });
                         new_bind = bind.as_ref().map(|b| InlineBind { name: b.name, ty_param: ty_pass });
+                        *bind = None;
                     }
                     _ => unreachable!()
                 }
@@ -114,7 +113,7 @@ impl RuleRhs {
 
                 cont.push(rule!(new_sym ::= displaced_lex));
             }
-            &Repeat(box ref mut sub_rule, op) => match sub_rule {
+            &Repeat(box ref mut sub_rule, _) => match sub_rule {
                 &Ident(..) => {},
                 other_sub_rule => {
                     other_sub_rule.extract_sub_rules(cx, syms, reprs, cont, false);
@@ -185,11 +184,11 @@ impl Rule {
         self.rhs.create_seq_rules(syms, cont);
     }
 
-    fn l0(rules: &[Rule], syms: &StrInterner) -> String {
+    fn l0(rules: &[Rule]) -> String {
         let reg_alt = rules.iter().map(|rule|
             match &rule.rhs {
                 &Lexeme(ref s, _, _) => {
-                    s.get().into_string()
+                    s.get().to_string()
                 }
                 _ => unreachable!()
             }
@@ -208,13 +207,13 @@ impl Rule {
     }
 }
 
-#[deriving(Copy, Clone, Show)]
+#[derive(Copy, Clone, Show)]
 pub enum KleeneOp {
     ZeroOrMore,
     OneOrMore,
 }
 
-#[deriving(Show)]
+#[derive(Show)]
 struct Rule {
     name: ast::Name,
     rhs: RuleRhs,
@@ -241,7 +240,7 @@ fn parse_name_or_repeat(parser: &mut Parser, syms: &mut StrInterner) -> RuleRhs 
             Ident(new_name, bound_with)
         } else {
             match parser.parse_optional_str() {
-                Some((s, style, suf)) => {
+                Some((s, _, suf)) => {
                     let sp = parser.last_span;
                     parser.expect_no_suffix(sp, "str literal", suf);
                     Lexeme(s, None, bound_with)
@@ -352,7 +351,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         match rule {
             Rule { rhs: Lexeme(s, action, bind), name } => {
                 if &*g1_syms.get(name) == "discard" {
-                    l0_discard_rules.push(s.get().into_string());
+                    l0_discard_rules.push(s.get().to_string());
                     return None;
                 }
                 l0_inline_actions.push((
@@ -364,10 +363,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
             other => Some(other)
         }
-    }).collect::<Vec<_>>();
-
-    // pass 3: flatten alternatives
-    let mut g1_rules = g1_rules.into_iter().flat_map(|rule| {
+    }).flat_map(|rule| {
+        // pass 3: flatten alternatives
         rule.alternatives_iter().into_iter()
     }).collect::<Vec<_>>();
 
@@ -385,7 +382,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     // LEXER -- L0
     let num_scan_syms = l0_rules.len();
 
-    let reg_alt_s = Rule::l0(l0_rules.as_slice(), &g1_syms);
+    let reg_alt_s = Rule::l0(l0_rules.as_slice());
     l0_discard_rules.push(reg_alt_s);
     let reg_alt_s = l0_discard_rules.connect("|");
     let reg_alt = reg_alt_s.as_slice();
@@ -458,7 +455,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             rblk
         );
     });
-    let (rule_exprs, rule_actions) = vec::unzip(rules);
+    let (rule_exprs, rule_actions): (Vec<_>, Vec<_>) = rules.unzip();
 
     // ``` let rules = &[$rule_exprs]; ```
     let num_rules = rule_exprs.len();
@@ -524,7 +521,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         for (&(lhs, rhs), id) in rules.iter().zip(rule_ids.iter_mut()) {
             *id = grammar.rule_new(lhs, rhs).unwrap();
         }
-        grammar.precompute();
+        grammar.precompute().unwrap();
 
         let scanner = regex!($reg_alt);
         (grammar, scan_syms, rule_ids, scanner)
@@ -578,7 +575,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     let (end_pos, tok_kind) = if start_pos == 0 {
                         self.positions[0]
                     } else {
-                        let end_idx = self.positions.binary_search_by(|&(el, _)| l.cmp(&start_pos))
+                        let end_idx = self.positions.binary_search_by(|&(el, _)| el.cmp(&start_pos))
                                                     .err()
                                                     .expect("binary search panicked");
                         self.positions[end_idx]
@@ -631,7 +628,6 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     };
 
     let slif_expr = quote_expr!(cx, {
-        use std::iter::{Map, Iterator};
         use marpa::{Tree, Rule, Symbol, Value, Step};
         use marpa::marpa::Values;
 
@@ -674,9 +670,11 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 $fn_parse_expr
             }
         }
-        impl<'a, 'b, 'l, T, C, D> Iterator<T> for SlifParse<'a, 'b, 'l, T, C, D>
+        impl<'a, 'b, 'l, T, C, D> Iterator for SlifParse<'a, 'b, 'l, T, C, D>
                 where C: for<'c> Fn(&[SlifRepr<'c, T>], Rule, &[Rule; $num_rules]) -> SlifRepr<'c, T>,
                       D: for<'c> Fn(&'c str, uint) -> SlifRepr<'c, T> {
+            type Item = T;
+
             fn next(&mut self) -> Option<T> {
                 $slif_iter_next_expr
             }
@@ -688,6 +686,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             $lex_cond_expr
         })
     });
+
+    // println!("{}", pprust::expr_to_string(&*slif_expr));
 
     MacExpr::new(slif_expr)
 }

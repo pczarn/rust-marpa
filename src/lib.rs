@@ -1,6 +1,6 @@
 #![crate_name = "marpa"]
 
-#![feature(plugin_registrar, macro_rules, unsafe_destructor)]
+#![feature(plugin_registrar, macro_rules, unsafe_destructor, associated_types)]
 
 extern crate libc;
 

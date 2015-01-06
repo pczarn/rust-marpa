@@ -11,3 +11,5 @@ plugin = true
 
 [dependencies.rust-marpa]
 path = ".."
+
+[dependencies.regex_macros]
