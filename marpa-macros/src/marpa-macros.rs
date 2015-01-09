@@ -4,6 +4,7 @@
 
 extern crate rustc;
 extern crate syntax;
+#[macro_use] extern crate log;
 
 use self::RuleRhs::*;
 use self::KleeneOp::*;
@@ -23,6 +24,7 @@ use syntax::print::pprust;
 
 use std::collections::HashSet;
 use std::mem;
+use std::fmt;
 
 #[plugin_registrar]
 pub fn plugin_registrar(reg: &mut ::rustc::plugin::Registry) {
@@ -40,11 +42,14 @@ macro_rules! rule {
 
 #[derive(Copy, Clone, Show, Hash, PartialEq, Eq)]
 enum InlineActionType {
-    Infer,
+    // Unknown,
+    InferT,
     StrSlice,
+    Continue,
+    DirectStr,
 }
 
-#[derive(Clone, Show)]
+#[derive(Clone)]
 struct InlineAction {
     block: P<ast::Block>,
     ty_return: InlineActionType,
@@ -60,7 +65,7 @@ impl InlineAction {
     fn new(block: P<ast::Block>) -> InlineAction {
         InlineAction {
             block: block,
-            ty_return: Infer
+            ty_return: InferT
         }
     }
 }
@@ -69,9 +74,22 @@ impl InlineBind {
     fn new(name: ast::Ident) -> InlineBind {
         InlineBind {
             name: name,
-            ty_param: Infer
+            ty_param: InferT
         }
     }
+}
+
+#[derive(Copy, Clone, Show)]
+pub enum KleeneOp {
+    ZeroOrMore,
+    OneOrMore,
+}
+
+#[derive(Clone, Show)]
+struct LexemeRhs {
+    regstr: token::InternedString,
+    bind: Option<InlineBind>,
+    action: Option<InlineAction>,
 }
 
 #[derive(Clone, Show)]
@@ -80,7 +98,13 @@ enum RuleRhs {
     Sequence(Vec<RuleRhs>, Option<InlineAction>),
     Ident(ast::Name, Option<InlineBind>),
     Repeat(Box<RuleRhs>, KleeneOp),
-    Lexeme(token::InternedString, Option<InlineAction>, Option<InlineBind>),
+    Lexeme(LexemeRhs),
+}
+
+#[derive(Show)]
+struct Rule {
+    name: ast::Name,
+    rhs: RuleRhs,
 }
 
 impl RuleRhs {
@@ -97,13 +121,13 @@ impl RuleRhs {
                 let new_bind;
 
                 match self {
-                    &Lexeme(_, ref mut action, ref mut bind) => {
-                        *action = Some(InlineAction {
-                            block: cx.block_expr(quote_expr!(cx, arg)),
+                    &Lexeme(ref mut lex) => {
+                        lex.action = Some(InlineAction {
+                            block: cx.block_expr(quote_expr!(cx, arg_)),
                             ty_return: ty_pass,
                         });
-                        new_bind = bind.as_ref().map(|b| InlineBind { name: b.name, ty_param: ty_pass });
-                        *bind = None;
+                        new_bind = lex.bind.as_ref().map(|b| InlineBind { name: b.name, ty_param: ty_pass });
+                        lex.bind = None;
                     }
                     _ => unreachable!()
                 }
@@ -184,19 +208,6 @@ impl Rule {
         self.rhs.create_seq_rules(syms, cont);
     }
 
-    fn l0(rules: &[Rule]) -> String {
-        let reg_alt = rules.iter().map(|rule|
-            match &rule.rhs {
-                &Lexeme(ref s, _, _) => {
-                    s.get().to_string()
-                }
-                _ => unreachable!()
-            }
-        ).collect::<Vec<_>>();
-
-        format!("({})", reg_alt.connect(")|("))
-    }
-
     fn alternatives_iter(self) -> Vec<Rule> {
         match self {
             Rule { rhs: Alternative(alt_seq), name } =>
@@ -205,18 +216,6 @@ impl Rule {
                 vec![rhs].into_iter().map(|alt| Rule { name: name, rhs: alt }).collect(),
         }
     }
-}
-
-#[derive(Copy, Clone, Show)]
-pub enum KleeneOp {
-    ZeroOrMore,
-    OneOrMore,
-}
-
-#[derive(Show)]
-struct Rule {
-    name: ast::Name,
-    rhs: RuleRhs,
 }
 
 fn parse_name_or_repeat(parser: &mut Parser, syms: &mut StrInterner) -> RuleRhs {
@@ -228,7 +227,7 @@ fn parse_name_or_repeat(parser: &mut Parser, syms: &mut StrInterner) -> RuleRhs 
                 parser.look_ahead(1, |t| *t == token::Colon) {
             let bound_with = parser.parse_ident();
             parser.expect(&token::Colon);
-            Some(InlineBind::new(bound_with))
+            Some(bound_with)
         } else {
             None
         };
@@ -237,13 +236,18 @@ fn parse_name_or_repeat(parser: &mut Parser, syms: &mut StrInterner) -> RuleRhs 
                 !parser.token.is_reserved_keyword() {
             let ident = parser.parse_ident();
             let new_name = syms.intern(ident.as_str());
-            Ident(new_name, bound_with)
+            // Give a better type?
+            Ident(new_name, bound_with.map(|b| InlineBind::new(b)))
         } else {
             match parser.parse_optional_str() {
                 Some((s, _, suf)) => {
                     let sp = parser.last_span;
                     parser.expect_no_suffix(sp, "str literal", suf);
-                    Lexeme(s, None, bound_with)
+                    Lexeme(LexemeRhs {
+                        regstr: s,
+                        bind: bound_with.map(|b| InlineBind { name: b, ty_param: DirectStr }),
+                        action: None,
+                    })
                 }
                 _ => break
             }
@@ -290,12 +294,14 @@ fn parse_rule(parser: &mut Parser, syms: &mut StrInterner) -> Option<Rule> {
     if parser.eat(&token::Tilde) {
         // assertion
         if let Sequence(seq, blk) = parse_rhs(parser, syms) {
-            if let Some(Lexeme(s, None, bound_with)) = seq.into_iter().next() {
+            if let Some(Lexeme(LexemeRhs { regstr, bind: bound_with, action: None }))
+                    = seq.into_iter().next() {
                 return Some(Rule {
                     name: new_name,
-                    rhs: Lexeme(s, blk, bound_with),
+                    rhs: Lexeme(LexemeRhs { regstr: regstr, bind: bound_with, action: blk }),
                 });
             }
+            // next?
         }
 
         let sp = parser.span;
@@ -312,6 +318,62 @@ fn parse_rule(parser: &mut Parser, syms: &mut StrInterner) -> Option<Rule> {
         parser.span_err(sp, "expected `::=` or `~`");
         None
     }
+}
+
+fn build_conditional(cx: &mut ExtCtxt,
+                     sp: Span,
+                     arg: Vec<(Option<InlineAction>, Vec<Option<InlineBind>>)>) -> P<ast::Expr> {
+    let mut cond_expr = quote_expr!(cx, panic!("unknown choice"));
+
+    for (n, (action, bounds)) in arg.into_iter().enumerate().rev() {
+        let arg_pat = cx.pat(sp, ast::PatVec(
+            bounds.iter().map(|bind| {
+                let pat = bind.as_ref().map(|b| cx.pat_ident(sp, b.name))
+                                       .unwrap_or_else(|| cx.pat_wild(sp));
+
+                match bind {
+                    &Some(InlineBind { ty_param: StrSlice, .. }) =>
+                        quote_pat!(cx, SlifRepr::ValStrSlice($pat)),
+                    &Some(InlineBind { ty_param: DirectStr, name }) =>
+                        cx.pat_ident(sp, name),
+                    &None =>
+                        pat,
+                    &Some(InlineBind { ty_param: Continue, .. }) =>
+                        unreachable!(),
+                    _ =>
+                        quote_pat!(cx, SlifRepr::ValInfer($pat)),
+                }
+            }).collect(),
+            None,
+            vec![]
+        ));
+
+        let action_expr = if let Some(a) = action {
+            match a {
+                InlineAction { ty_return: InferT, block } =>
+                    quote_expr!(cx, SlifRepr::ValInfer($block)),
+                InlineAction { ty_return: StrSlice, block } =>
+                    quote_expr!(cx, SlifRepr::ValStrSlice($block)),
+                InlineAction { ty_return: Continue, .. } =>
+                    quote_expr!(cx, SlifRepr::Continue),
+                InlineAction { ty_return: DirectStr, .. } =>
+                    unreachable!(),
+            }
+        } else {
+            quote_expr!(cx, SlifRepr::ValStrSlice(arg_))
+        };
+
+        cond_expr = cx.expr_if(sp, quote_expr!(cx, choice_ == $n),
+                                   quote_expr!(cx,
+                                        match args {
+                                            $arg_pat => $action_expr,
+                                            _ => unreachable!()
+                                        }
+                                   ),
+                                   Some(cond_expr));
+    }
+
+    cond_expr
 }
 
 fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
@@ -331,6 +393,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         }
     }
 
+    debug!("Parsed: {:?}", g1_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
+
     // prepare grammar rules
 
     let mut val_reprs = HashSet::new();
@@ -345,20 +409,17 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     // pass 2: extract l0
     let mut l0_rules = vec![];
     let mut l0_discard_rules = vec![];
-    let mut l0_inline_actions = vec![];
 
     let mut g1_rules = g1_rules.into_iter().filter_map(|rule| {
         match rule {
-            Rule { rhs: Lexeme(s, action, bind), name } => {
+            Rule { rhs: Lexeme(rhs), name } => {
                 if &*g1_syms.get(name) == "discard" {
-                    l0_discard_rules.push(s.get().to_string());
-                    return None;
+                    l0_discard_rules.push(rhs.regstr.get().to_string());
+                } else {
+                    val_reprs.insert(StrSlice);
+                    l0_rules.push(Rule { rhs: Lexeme(rhs), name: name });
                 }
-                l0_inline_actions.push((
-                    action.clone(),
-                    bind
-                ));
-                l0_rules.push(Rule { rhs: Lexeme(s, action, None), name: name });
+
                 None
             }
             other => Some(other)
@@ -368,53 +429,63 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         rule.alternatives_iter().into_iter()
     }).collect::<Vec<_>>();
 
+    debug!("For lexing: {}", l0_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
+
     // rule :start
     let &Rule { name: implicit_start, .. } = &g1_rules[0];
-    g1_rules.push(Rule::ident(start_sym, implicit_start));
+    let start_rule = Rule::ident(start_sym, implicit_start);
+    g1_rules.push(start_rule);
 
+    // pass 4: sequences
     let mut g1_seq_rules = vec![];
     for rule in g1_rules.iter_mut() {
         rule.create_seq_rules(&mut g1_syms, &mut g1_seq_rules);
     }
+    debug!("Sequence rules: {}", g1_seq_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
 
     let num_syms = g1_syms.len();
 
     // LEXER -- L0
     let num_scan_syms = l0_rules.len();
 
-    let reg_alt_s = Rule::l0(l0_rules.as_slice());
-    l0_discard_rules.push(reg_alt_s);
-    let reg_alt_s = l0_discard_rules.connect("|");
-    let reg_alt = reg_alt_s.as_slice();
-
-    // ``` if tok_kind == 0 { $block } ```
-    let mut lex_cond_expr = quote_expr!(cx, panic!("unknown rule"));
-    for (n, (action, bind)) in l0_inline_actions.into_iter().enumerate().rev() {
-        let action_expr = action.map(|a| cx.expr_block(a.block))
-                                .unwrap_or(quote_expr!(cx, {7u}));
-        let action_expr = quote_expr!(cx, SlifRepr::ValStrSlice($action_expr));
-        let arg_pat = cx.pat_ident(sp, bind.map(|b| b.name)
-                                           .unwrap_or_else(|| token::gensym_ident("_"))); // str_to_ident
-        lex_cond_expr = cx.expr_if(sp, quote_expr!(cx, tok_kind == $n),
-                                        quote_expr!(cx, {
-                                            let $arg_pat = arg;
-                                            $action_expr
-                                        }),
-                                        Some(lex_cond_expr));
-    }
-
-    // ``` let scan_syms = [syms[$l0_sym_id0], syms[$l0_sym_id1], ...]; ```
+    // ``` [syms[$l0_sym_id0], syms[$l0_sym_id1], ...] ```
     let scan_syms_exprs = l0_rules.iter().map(|rule| {
         let symid = rule.name.uint();
         quote_expr!(cx, syms[$symid])
     }).collect::<Vec<_>>();
     let scan_syms_expr = cx.expr_vec(sp, scan_syms_exprs);
-    let let_scan_syms_stmt = cx.stmt_let(sp, false, cx.ident_of("scan_syms"), scan_syms_expr);
+
+    let mut l0_inline_actions = vec![];
+
+    let l0_rules = l0_rules.into_iter().map(|rule| {
+        if let Rule { rhs: Lexeme(mut lex), .. } = rule {
+            l0_inline_actions.push((
+                lex.action.take(),
+                vec![lex.bind.take()]
+            ));
+
+            lex
+        } else {
+            unreachable!()
+        }
+    }).collect::<Vec<_>>();
+
+    // Lexer regexstr
+    let reg_alt = l0_rules.iter().map(|rule|
+        rule.regstr.get().to_string()
+    ).collect::<Vec<_>>();
+
+    l0_discard_rules.push(format!("({})", reg_alt.connect(")|(")));
+    let reg_alt_s = l0_discard_rules.connect("|");
+    let reg_alt = reg_alt_s.as_slice();
+
+    // ``` if tok_kind == 0 { $block } ... ```
+    let lex_cond_expr = build_conditional(cx, sp, l0_inline_actions);
 
     // RULES -- G1
     let mut rhs_exprs = vec![];
 
-    let rules =
+    let (rule_exprs, rule_actions): (Vec<_>, Vec<_>) =
     g1_rules.into_iter().chain(g1_seq_rules.into_iter()).map(|rule| {
         let rblk = match rule.rhs {
             Sequence(seq, action) => {
@@ -434,13 +505,12 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             Ident(rhs_sym, bound_with) => {
                 let rhs_sym = rhs_sym.uint();
                 rhs_exprs.push(quote_expr!(cx, syms[$rhs_sym]));
-                // bad hack incoming. hard to figure this out
+
                 (Some(InlineAction {
-                    block: cx.block_expr(quote_expr!(cx, unsafe { return ::std::ptr::read(&args[0]) })),
-                    ty_return: bound_with.as_ref().map(|b| b.ty_param).unwrap_or(Infer),
+                    block: cx.block_expr(quote_expr!(cx, ())),
+                    ty_return: Continue,
                  }),
                  vec![bound_with])
-
             }
             // &Lexeme(ref s)
             _ => panic!("not an ident or seq or lexeme")
@@ -454,58 +524,14 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             ]),
             rblk
         );
-    });
-    let (rule_exprs, rule_actions): (Vec<_>, Vec<_>) = rules.unzip();
+    }).unzip();
 
-    // ``` let rules = &[$rule_exprs]; ```
+    // ``` [$rule_exprs] ```
     let num_rules = rule_exprs.len();
     let rules_expr = cx.expr_vec(sp, rule_exprs);
-    let let_rules_stmt =
-        cx.stmt_let_typed(sp,
-                          false,
-                          cx.ident_of("rules"),
-                          quote_ty!(cx, [(::marpa::Symbol, &[::marpa::Symbol]); $num_rules]),
-                          rules_expr);
 
     // ``` if rule == self.rule_ids[$x] { $block } ```
-    let mut rule_cond_expr = quote_expr!(cx, panic!("unknown rule"));
-    for (n, (action, bounds)) in rule_actions.into_iter().enumerate().rev() {
-        let action_expr = action.map(|a| {
-            match a {
-                InlineAction { ty_return: Infer, block } =>
-                    quote_expr!(cx, SlifRepr::ValInfer($block)),
-                InlineAction { ty_return: StrSlice, block } =>
-                    quote_expr!(cx, SlifRepr::ValInfer($block)),
-            }
-        }).unwrap_or(quote_expr!(cx, SlifRepr::ValInfer(7u)));
-
-        let args_pat = cx.pat(sp, ast::PatVec(
-            bounds.into_iter().map(|bind| {
-                // bind to an ident or ignore
-                let bind_name = bind.as_ref().map(|b| b.name).unwrap_or_else(|| token::gensym_ident("_"));
-                let pat = cx.pat_ident(sp, bind_name); // str_to_ident?
-                match bind {
-                    Some(InlineBind { ty_param: StrSlice, .. }) =>
-                        quote_pat!(cx, SlifRepr::ValStrSlice($pat)),
-                    _ =>
-                        quote_pat!(cx, SlifRepr::ValInfer($pat)),
-                }
-            }).collect(),
-            None,
-            vec![]
-        ));
-
-
-
-        rule_cond_expr = cx.expr_if(sp, quote_expr!(cx, rule == rules[$n]),
-                                        quote_expr!(cx,
-                                            match args {
-                                                $args_pat => $action_expr,
-                                                _ => unreachable!()
-                                            }
-                                        ),
-                                        Some(rule_cond_expr));
-    }
+    let rule_cond_expr = build_conditional(cx, sp, rule_actions);
 
     // Generated code
 
@@ -515,8 +541,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         let mut syms: [::marpa::Symbol; $num_syms] = unsafe { ::std::mem::uninitialized() };
         for sym in syms.iter_mut() { *sym = grammar.symbol_new().unwrap(); }
         grammar.start_symbol_set(syms[0]);
-        $let_rules_stmt
-        $let_scan_syms_stmt
+        let rules: [(::marpa::Symbol, &[::marpa::Symbol]); $num_rules] = $rules_expr;
+        let scan_syms = $scan_syms_expr;
         let mut rule_ids: [::marpa::Rule; $num_rules] = unsafe { ::std::mem::uninitialized() };
         for (&(lhs, rhs), id) in rules.iter().zip(rule_ids.iter_mut()) {
             *id = grammar.rule_new(lhs, rhs).unwrap();
@@ -588,15 +614,19 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     let rule = valuator.rule();
                     let arg_0 = valuator.arg_0() as uint;
                     let arg_n = valuator.arg_n() as uint;
-                    let elem = self.parent.rules_closure.call((self.stack.slice(arg_0, arg_n + 1),
-                                                              rule,
-                                                              &self.parent.rule_ids));
-                    (arg_0, elem)
+                    let slice = self.stack.slice(arg_0, arg_n + 1);
+                    let choice = self.parent.rule_ids.iter().position(|&mut: r| *r == rule);
+                    let elem = self.parent.rules_closure.call((slice,
+                                                               choice.expect("unknown rule")));
+                    match elem {
+                        SlifRepr::Continue => continue,
+                        other_elem => (arg_0, other_elem),
+                    }
                 }
                 Step::StepInactive | Step::StepNullingSymbol => {
                     break;
                 }
-                other => panic!("unexpected step {}", other),
+                other => panic!("unexpected step {:?}", other),
             };
 
             if i == self.stack.len() {
@@ -616,15 +646,19 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
     let repr_enum = if val_reprs.is_empty() {
         quote_item!(cx,
-            struct SlifRepr<'a, T>(T);
+            enum SlifRepr<'a, T> {
+                ValInfer(T),
+                Continue,
+            }
         )
     } else {
         quote_item!(cx,
-             enum SlifRepr<'a, T> {
-                 ValInfer(T),
-                 ValStrSlice(&'a str),
-             }
-         )
+            enum SlifRepr<'a, T> {
+                ValInfer(T),
+                ValStrSlice(&'a str),
+                Continue,
+            }
+        )
     };
 
     let slif_expr = quote_expr!(cx, {
@@ -651,7 +685,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         $repr_enum
 
         impl<'a, T, C, D> SlifGrammar<'a, T, C, D>
-                where C: for<'c> Fn(&[SlifRepr<'c, T>], Rule, &[Rule; $num_rules]) -> SlifRepr<'c, T>,
+                where C: for<'c> Fn(&[SlifRepr<'c, T>], uint) -> SlifRepr<'c, T>,
                       D: for<'c> Fn(&'c str, uint) -> SlifRepr<'c, T> {
             #[inline]
             fn new(rules_closure: C, lex_closure: D) -> SlifGrammar<'a, T, C, D> {
@@ -671,7 +705,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
         }
         impl<'a, 'b, 'l, T, C, D> Iterator for SlifParse<'a, 'b, 'l, T, C, D>
-                where C: for<'c> Fn(&[SlifRepr<'c, T>], Rule, &[Rule; $num_rules]) -> SlifRepr<'c, T>,
+                where C: for<'c> Fn(&[SlifRepr<'c, T>], uint) -> SlifRepr<'c, T>,
                       D: for<'c> Fn(&'c str, uint) -> SlifRepr<'c, T> {
             type Item = T;
 
@@ -679,15 +713,30 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 $slif_iter_next_expr
             }
         }
-        SlifGrammar::new(|&: args, rule, rules| {
-            $rule_cond_expr
-        },
-        |&: arg, tok_kind| {
-            $lex_cond_expr
-        })
+        SlifGrammar::new(
+            |&: args, choice_| {
+                $rule_cond_expr
+            },
+            |&: arg_, choice_| {
+                let args: &[_] = &[arg_];
+                $lex_cond_expr
+            }
+        )
     });
 
-    // println!("{}", pprust::expr_to_string(&*slif_expr));
+    debug!("{}", pprust::expr_to_string(&*slif_expr));
 
     MacExpr::new(slif_expr)
+}
+
+// Debugging
+
+impl fmt::Show for InlineAction {
+    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        try!(fmt.write_fmt(format_args!("InlineAction {{ block: {}, ty_return: ",
+                           pprust::block_to_string(&*self.block))));
+        try!(self.ty_return.fmt(fmt));
+        try!(fmt.write_str(" }}"));
+        Ok(())
+    }
 }
