@@ -1,12 +1,13 @@
-#![feature(phase, unboxed_closures, associated_types)]
+#![feature(plugin, unboxed_closures, associated_types)]
 
-#[phase(plugin, link)]
+#[plugin]
 extern crate "marpa-macros" as marpa_macros;
 
 extern crate marpa;
 extern crate regex;
 
-#[phase(plugin, link)]
+#[plugin]
+#[no_link]
 extern crate regex_macros;
 
 fn apply(op: &str, l: i32, r: i32) -> i32 {
@@ -25,7 +26,7 @@ fn main() {
                 | num:r"\d" { num.parse().unwrap() } ;
         discard ~ r"\s" ;
     };
-    for result in simple.parse("2 - 0 * 3 + 1") {
+    for result in simple.parses_iter("2 - 0 * 3 + 1") {
         println!("{}", result);
     }
 }

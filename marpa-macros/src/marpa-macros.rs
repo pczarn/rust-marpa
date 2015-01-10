@@ -132,28 +132,29 @@ impl InlineAction {
 }
 
 impl InlineBind {
-    fn pat_match(self, cx: &mut Context) -> (P<ast::Pat>, Option<P<ast::Stmt>>) {
+    fn pat_match(self, cx: &mut Context, nth: uint) -> (P<ast::Pat>, Option<P<ast::Stmt>>) {
         let InlineBind { ty_param, pat } = self;
 
-        let (in_pat, by_val) = match pat.node {
-            ast::PatIdent(ast::BindByValue(..), _, _) if ty_param != DirectStr =>
-                (pat.clone(),
-                 Some((pat.clone(), quote_pat!(cx.ext, ref mut $pat)))),
+        let by_val_ident = match pat.node {
+            ast::PatIdent(ast::BindByValue(..), ident, _) if ty_param != DirectStr =>
+                Some(ident),
             _ =>
-                (pat, None)
+                None
         };
+
+        let tmppat = pat.clone();
 
         let mut b_pat = match ty_param {
             InferT =>
-                quote_pat!(cx.ext, SlifRepr::ValInfer($in_pat)),
+                quote_pat!(cx.ext, SlifRepr::ValInfer($pat)),
             StrSlice =>
-                quote_pat!(cx.ext, SlifRepr::ValStrSlice($in_pat)),
+                quote_pat!(cx.ext, SlifRepr::ValStrSlice($pat)),
             DirectStr =>
-                in_pat,
+                pat,
             Explicit(n) => {
                 let n_s = format!("Spec{}", n);
                 let ident = token::str_to_ident(n_s.as_slice());
-                quote_pat!(cx.ext, SlifRepr::$ident($in_pat))
+                quote_pat!(cx.ext, SlifRepr::$ident($pat))
             }
             Continue | InferFromRule =>
                 unreachable!(),
@@ -161,15 +162,14 @@ impl InlineBind {
 
         let mut r_stmt = None;
 
-        if let Some((pat, pat_ref)) = by_val {
+        if let Some(ident) = by_val_ident {
             r_stmt = Some(quote_stmt!(cx.ext,
-                let $pat = if let $b_pat = mem::replace($pat, SlifRepr::Continue) {
-                    $pat
-                } else {
-                    panic!("here")
-                }
+                let $ident = match mem::replace(&mut args[$nth], SlifRepr::Continue) {
+                    $b_pat => $ident,
+                    _ => unreachable!()
+                };
             ));
-            b_pat = pat_ref;
+            b_pat = cx.ext.pat_wild(cx.sp);
         }
 
         (b_pat, r_stmt)
@@ -280,8 +280,8 @@ impl Rule {
 
                 if *elem == Some(InferFromRule) {
                     *elem = ty_return;
-                } else if *elem != ty_return {
-                    panic!("cannot infer a type");
+                } else if *elem != ty_return && ty_return != Some(InferFromRule) {
+                    panic!("cannot infer: expected {:?}, found {:?}", elem, ty_return);
                 }
             }
             _ => {}
@@ -471,9 +471,9 @@ impl<'a, 'b: 'a> Context<'a, 'b> {
 
         for (n, (action, bounds)) in arg.into_iter().enumerate().rev() {
             let (bounds_pat, stmts): (Vec<_>, Vec<_>) =
-            bounds.into_iter().map(|bind_opt| {
+            bounds.into_iter().enumerate().map(|(n, bind_opt)| {
                 if let Some(bind) = bind_opt {
-                    bind.pat_match(self)
+                    bind.pat_match(self, n)
                 } else {
                     (self.ext.pat_wild(self.sp), None)
                 }
@@ -492,15 +492,13 @@ impl<'a, 'b: 'a> Context<'a, 'b> {
             };
 
             cond_expr = self.ext.expr_if(self.sp, quote_expr!(self.ext, choice_ == $n),
-                                       quote_expr!(self.ext,
+                                       quote_expr!(self.ext, {
+                                            $stmts
                                             match args {
-                                                $arg_pat => {
-                                                    $stmts
-                                                    $action_expr
-                                                }
+                                                $arg_pat => $action_expr,
                                                 _ => unreachable!()
                                             }
-                                       ),
+                                       }),
                                        Some(cond_expr));
         }
 
