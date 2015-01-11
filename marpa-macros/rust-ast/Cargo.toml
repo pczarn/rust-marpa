@@ -1,0 +1,12 @@
+[package]
+
+name = "rust-marpa-macros-test"
+version = "0.0.1"
+authors = [ "pioczarn@gmail.com" ]
+
+[[bin]]
+name = "myexample"
+path = "rust-ast.rs"
+
+[dependencies.rust-marpa-macros]
+path = ".."
