@@ -19,37 +19,27 @@ use syntax::ptr::P;
 
 use syntax::ast::{Ident, Expr, Path, PathSegment, PathParameters};
 
-fn apply(op: &str, l: i32, r: i32) -> i32 {
-    match op {
-        "+" => l + r,
-        "-" => l - r,
-        "*" => l * r,
-        "/" => l / r,
-        _ => panic!(),
-    }
+fn psp<T: 'static>(arg: T) -> P<codemap::Spanned<T>> {
+    P(codemap::dummy_spanned(arg))
+}
+
+fn sp<T>(arg: T) -> codemap::Spanned<T> {
+    codemap::dummy_spanned(arg)
+}
+
+fn mk_expr(node: ast::Expr_) -> P<Expr> {
+    P(Expr {
+        id: ast::DUMMY_NODE_ID,
+        node: node,
+        span: codemap::DUMMY_SP,
+    })
+}
+
+fn path_segment(i: Ident) -> PathSegment {
+    ast::PathSegment { identifier: i, parameters: PathParameters::none() }
 }
 
 fn main() {
-    fn psp<T: 'static>(arg: T) -> P<codemap::Spanned<T>> {
-        P(codemap::dummy_spanned(arg))
-    }
-
-    fn sp<T>(arg: T) -> codemap::Spanned<T> {
-        codemap::dummy_spanned(arg)
-    }
-
-    fn mk_expr(node: ast::Expr_) -> P<Expr> {
-        P(Expr {
-            id: ast::DUMMY_NODE_ID,
-            node: node,
-            span: codemap::DUMMY_SP,
-        })
-    }
-
-    fn path_segment(i: Ident) -> PathSegment {
-        ast::PathSegment { identifier: i, parameters: PathParameters::none() }
-    }
-
     let mut rust = grammar! {
         primary_expr ::=
               li:lit_integer -> P<Expr> { mk_expr(ast::ExprLit(li)) }
