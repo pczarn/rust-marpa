@@ -1,6 +1,6 @@
 #![crate_name = "marpa-macros"]
 
-#![feature(plugin_registrar, quote, globs, macro_rules, box_syntax)]
+#![feature(plugin_registrar, quote, globs, macro_rules, box_syntax, rustc_private)]
 
 extern crate rustc;
 extern crate syntax;
@@ -41,7 +41,7 @@ macro_rules! rule {
     )
 }
 
-#[derive(Copy, Clone, Show, Hash, PartialEq, Eq)]
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
 enum InlineActionType {
     InferT,
     StrSlice,
@@ -57,7 +57,7 @@ struct InlineAction {
     ty_return: InlineActionType,
 }
 
-#[derive(Clone, Show)]
+#[derive(Clone, Debug)]
 struct InlineBind {
     pat: P<ast::Pat>,
     ty_param: InlineActionType,
@@ -81,20 +81,20 @@ impl InlineBind {
     }
 }
 
-#[derive(Copy, Clone, Show)]
+#[derive(Copy, Clone, Debug)]
 pub enum KleeneOp {
     ZeroOrMore,
     OneOrMore,
 }
 
-#[derive(Clone, Show)]
+#[derive(Clone, Debug)]
 struct LexemeRhs {
     regstr: token::InternedString,
     bind: Option<InlineBind>,
     action: Option<InlineAction>,
 }
 
-#[derive(Clone, Show)]
+#[derive(Clone, Debug)]
 enum RuleRhs {
     Alternative(Vec<RuleRhs>),
     Sequence(Vec<RuleRhs>, Option<InlineAction>),
@@ -103,7 +103,7 @@ enum RuleRhs {
     Lexeme(LexemeRhs),
 }
 
-#[derive(Show)]
+#[derive(Debug)]
 struct Rule {
     name: ast::Name,
     rhs: RuleRhs,
@@ -565,7 +565,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         match rule {
             Rule { rhs: Lexeme(rhs), name } => {
                 if &*ctxt.syms.get(name) == "discard" {
-                    l0_discard_rules.push(rhs.regstr.get().to_string());
+                    l0_discard_rules.push(rhs.regstr.to_string());
                 } else {
                     ctxt.val_reprs.insert(StrSlice);
                     l0_rules.push(Rule { rhs: Lexeme(rhs), name: name });
@@ -625,7 +625,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     // Lexer regexstr
     for rule in l0_rules.into_iter() {
         let regstr = if let Rule { rhs: Lexeme(LexemeRhs { ref regstr, .. }), name } = rule {
-            regstr.get().to_string()
+            regstr.to_string()
         } else {
             unreachable!()
         };
@@ -645,7 +645,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     let num_scan_syms = reg_dedup.len();
 
     let scan_syms_exprs = reg_dedup.values().map(|rule| {
-        let symid = rule.name.uint();
+        let symid = rule.name.usize();
         quote_expr!(ctxt.ext, syms[$symid])
     }).collect::<Vec<_>>();
 
@@ -699,9 +699,9 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                         Ident(name, bind) => {
                             bounds.push(bind);
                             let id = if let Some(replacement) = reg_dups.get(&name) {
-                                replacement.uint()
+                                replacement.usize()
                             } else {
-                                name.uint()
+                                name.usize()
                             };
                             quote_expr!(ctxt.ext, syms[$id])
                         }
@@ -712,9 +712,9 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
             Ident(rhs_sym, bound_with) => {
                 let rhs_id = if let Some(replacement) = reg_dups.get(&rhs_sym) {
-                    replacement.uint()
+                    replacement.usize()
                 } else {
-                    rhs_sym.uint()
+                    rhs_sym.usize()
                 };
                 rhs_exprs.push(quote_expr!(ctxt.ext, syms[$rhs_id]));
 
@@ -728,7 +728,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             _ => panic!("not an ident or seq or lexeme")
         };
 
-        let lhs = rule.name.uint();
+        let lhs = rule.name.usize();
 
         return (
             ctxt.ext.expr_tuple(sp, vec![
@@ -834,17 +834,17 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     //     self.positions[end_idx]
                     // };
                     let (start_pos, end_pos, tok_kind) = self.positions[idx];
-                    (valuator.result() as uint,
+                    (valuator.result() as usize,
                      self.parent.lex_closure.call((self.input.slice(start_pos as usize,
                                                                     end_pos as usize),
                                                    tok_kind)))
                 }
                 Step::StepRule => {
                     let rule = valuator.rule();
-                    let arg_0 = valuator.arg_0() as uint;
-                    let arg_n = valuator.arg_n() as uint;
+                    let arg_0 = valuator.arg_0() as usize;
+                    let arg_n = valuator.arg_n() as usize;
                     let slice = self.stack.slice_mut(arg_0, arg_n + 1);
-                    let choice = self.parent.rule_ids.iter().position(|&mut: r| *r == rule);
+                    let choice = self.parent.rule_ids.iter().position(|r| *r == rule);
                     let elem = self.parent.rules_closure.call((slice,
                                                                choice.expect("unknown rule")));
                     match elem {
@@ -921,7 +921,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
         struct SlifParse<'a, 'b, 'l, C: 'b, D: 'b, $T> {
             tree: Tree,
-            positions: Vec<(u32, u32, uint)>,
+            positions: Vec<(u32, u32, usize)>,
             input: &'a str,
             stack: Vec<SlifRepr<'a, $T>>,
             parent: &'b SlifGrammar<'l, C, D, $T>,
@@ -930,8 +930,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         $repr_enum
 
         impl<'a, C, D, $T> SlifGrammar<'a, C, D, $T>
-                where C: for<'c> Fn(&mut [SlifRepr<'c, $T>], uint) -> SlifRepr<'c, $T>,
-                      D: for<'c> Fn(&'c str, uint) -> SlifRepr<'c, $T> {
+                where C: for<'c> Fn(&mut [SlifRepr<'c, $T>], usize) -> SlifRepr<'c, $T>,
+                      D: for<'c> Fn(&'c str, usize) -> SlifRepr<'c, $T> {
             #[inline]
             fn new(rules_closure: C, lex_closure: D) -> SlifGrammar<'a, C, D, $T> {
                 // $test
@@ -952,8 +952,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
         }
         impl<'a, 'b, 'l, C, D, $T> Iterator for SlifParse<'a, 'b, 'l, C, D, $T>
-                where C: for<'c> Fn(&mut [SlifRepr<'c, $T>], uint) -> SlifRepr<'c, $T>,
-                      D: for<'c> Fn(&'c str, uint) -> SlifRepr<'c, $T> {
+                where C: for<'c> Fn(&mut [SlifRepr<'c, $T>], usize) -> SlifRepr<'c, $T>,
+                      D: for<'c> Fn(&'c str, usize) -> SlifRepr<'c, $T> {
             type Item = $ty_return;
 
             fn next(&mut self) -> Option<$ty_return> {
@@ -961,10 +961,10 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
         }
         SlifGrammar::new(
-            |&: args, choice_| {
+            |args, choice_| {
                 $rule_cond_expr
             },
-            |&: arg_, choice_| {
+            |arg_, choice_| {
                 let args: &[_] = &[arg_];
                 $lex_cond_expr
             }
@@ -978,7 +978,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
 // Debugging
 
-impl fmt::Show for InlineAction {
+impl fmt::Debug for InlineAction {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         try!(fmt.write_fmt(format_args!("InlineAction {{ block: {}, ty_return: ",
                            pprust::block_to_string(&*self.block))));

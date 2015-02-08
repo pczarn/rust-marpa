@@ -13,7 +13,7 @@ extern crate regex_macros;
 extern crate time;
 
 use std::collections::BTreeMap;
-use std::io::File;
+use std::old_io::File;
 use std::os::args;
 
 use time::precise_time_ns;

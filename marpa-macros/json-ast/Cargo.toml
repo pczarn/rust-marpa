@@ -11,4 +11,10 @@ path = "json-ast.rs"
 [dependencies.rust-marpa-macros]
 path = ".."
 
+[dependencies.rust-marpa]
+path = "../.."
+
+[dependencies.regex]
+[dependencies.regex_macros]
+
 [dependencies.time]
