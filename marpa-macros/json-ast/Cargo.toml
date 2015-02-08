@@ -10,3 +10,5 @@ path = "json-ast.rs"
 
 [dependencies.rust-marpa-macros]
 path = ".."
+
+[dependencies.time]

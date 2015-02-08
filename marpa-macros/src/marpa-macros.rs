@@ -43,7 +43,6 @@ macro_rules! rule {
 
 #[derive(Copy, Clone, Show, Hash, PartialEq, Eq)]
 enum InlineActionType {
-    // Unknown,
     InferT,
     StrSlice,
     Continue,
@@ -152,7 +151,7 @@ impl InlineAction {
 }
 
 impl InlineBind {
-    fn pat_match(self, cx: &mut Context, nth: uint)
+    fn pat_match(self, cx: &mut Context, nth: usize)
                 -> (P<ast::Pat>, Option<(P<ast::Expr>, P<ast::Pat>)>) {
         let InlineBind { ty_param, pat } = self;
 
@@ -514,10 +513,6 @@ impl<'a, 'b: 'a> Context<'a, 'b> {
                 quote_expr!(self.ext, SlifRepr::ValStrSlice(arg_))
             };
 
-            debug!("tup_arg: {:?}", tup_arg);
-            debug!("tup_pat: {:?}", tup_pat);
-            debug!("block: {:?}", action_expr);
-
             cond_expr = self.ext.expr_if(self.sp, quote_expr!(self.ext, choice_ == $n),
                                        quote_expr!(self.ext, {
                                             // $stmts
@@ -775,6 +770,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         let mut recce = ::marpa::Recognizer::new(&mut self.grammar).unwrap();
         recce.start_input();
 
+        let ns = precise_time_ns();
+
         let mut positions = vec![];
 
         for capture in self.scanner.captures_iter(input) {
@@ -783,8 +780,15 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 _ => continue
             };
             let (start_pos, end_pos) = capture.pos(pos + 1).expect("pos panicked");
-            positions.push((end_pos, pos));
-            recce.alternative(self.scan_syms[pos], (start_pos + 1) as i32, 1); // 0 is reserved
+            positions.push((start_pos as u32, end_pos as u32, pos));
+        }
+
+        println!("regex: elapsed {}", (precise_time_ns() - ns) as f64 / 1_000_000_000f64);
+
+        let ns = precise_time_ns();
+
+        for (nth, &(start_pos, end_pos, pos)) in positions.iter().enumerate() {
+            recce.alternative(self.scan_syms[pos], nth as i32 + 1, 1); // 0 is reserved
             recce.earleme_complete();
         }
 
@@ -795,6 +799,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         ).and_then(|mut order|
             ::marpa::Tree::new(&mut order)
         );
+
+        println!("marpa: elapsed {}", (precise_time_ns() - ns) as f64 / 1_000_000_000f64);
 
         SlifParse {
             tree: tree.unwrap(),
@@ -818,17 +824,19 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         loop {
             let (i, el) = match valuator.step() {
                 Step::StepToken => {
-                    let start_pos = valuator.token_value() as uint - 1;
-                    let (end_pos, tok_kind) = if start_pos == 0 {
-                        self.positions[0]
-                    } else {
+                    let idx = valuator.token_value() as usize - 1;
+                    // let (end_pos, tok_kind) = if start_pos == 0 {
+                    //     self.positions[0]
+                    // } else {
                         // println!("{:?} in {:?}", start_pos, self.positions);
-                        let end_idx = self.positions.binary_search_by(|&(el, _)| el.cmp(&start_pos))
-                                                    .unwrap_or_else(|x| x - 1) + 1;
-                        self.positions[end_idx]
-                    };
+                        // let end_idx = self.positions.binary_search_by(|&(el, _)| el.cmp(&start_pos))
+                        //                             .unwrap_or_else(|x| x - 1) + 1;
+                    //     self.positions[end_idx]
+                    // };
+                    let (start_pos, end_pos, tok_kind) = self.positions[idx];
                     (valuator.result() as uint,
-                     self.parent.lex_closure.call((self.input.slice(start_pos, end_pos),
+                     self.parent.lex_closure.call((self.input.slice(start_pos as usize,
+                                                                    end_pos as usize),
                                                    tok_kind)))
                 }
                 Step::StepRule => {
@@ -913,7 +921,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
         struct SlifParse<'a, 'b, 'l, C: 'b, D: 'b, $T> {
             tree: Tree,
-            positions: Vec<(uint, uint)>,
+            positions: Vec<(u32, u32, uint)>,
             input: &'a str,
             stack: Vec<SlifRepr<'a, $T>>,
             parent: &'b SlifGrammar<'l, C, D, $T>,

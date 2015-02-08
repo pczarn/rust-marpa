@@ -10,7 +10,13 @@ extern crate regex;
 #[no_link]
 extern crate regex_macros;
 
+extern crate time;
+
 use std::collections::BTreeMap;
+use std::io::File;
+use std::os::args;
+
+use time::precise_time_ns;
 
 use self::Json::*;
 
@@ -28,6 +34,10 @@ enum Json {
 
 fn main() {
     let mut json = grammar! {
+        start ::=
+            o:object -> Json { o }
+            | a:array -> _ { a } ;
+
         object ::=
             r"\{" m:members r"\}" -> Json { Object(m) }
             | r"\{" r"\}" -> _ { Object(BTreeMap::new()) } ;
@@ -84,14 +94,28 @@ fn main() {
 
         frac_part ::= f:r"\.\d+(?:[eE][-+]?)?\d*" -> f64 { f.parse().unwrap() } ;
 
-        integer ::= i:r"[1-9]*\d" -> u64 { i.parse().unwrap() } ;
+        integer ::= i:r"\d+" -> u64 { i.parse().unwrap() } ;
 
         string ~ s:r#""(?:\\"|[^"])*""# -> String { s.slice(1, s.len() - 1).to_string() } ;
 
         discard ~ r"\s" ;
     };
 
-    for ast in json.parses_iter(r#"{ "a": [123.123E-100, { "b\"c": null }] }"#) {
-        println!("{:?}", ast);
+    for json_file in args().iter().skip(1) {
+        let contents = File::open(&Path::new(json_file.as_slice())).read_to_string().unwrap();
+
+        let mut iter = json.parses_iter(contents.as_slice());
+
+        let ns = precise_time_ns();
+
+        for ast in iter {
+
+            // println!("{:?}", ast);
+        }
+        println!("elapsed {}", (precise_time_ns() - ns) as f64 / 1_000_000_000f64);
     }
+
+    // for ast in json.parses_iter(r#"{ "a": [123.123E-100, { "b\"c": null }] }"#) {
+    //     println!("{:?}", ast);
+    // }
 }
