@@ -623,6 +623,14 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
     // LEXER -- L0
     // Lexer regexstr
+    let reg_alts = l0_rules.into_iter().map(|rule| {
+        let regstr = if let Rule { rhs: Lexeme(LexemeRhs { ref regstr, .. }), name } = rule {
+            regstr.to_string()
+        } else {
+            unreachable!()
+        };
+    }).collect::<Vec<_>>();
+
     for rule in l0_rules.into_iter() {
         let regstr = if let Rule { rhs: Lexeme(LexemeRhs { ref regstr, .. }), name } = rule {
             regstr.to_string()
@@ -649,12 +657,12 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         quote_expr!(ctxt.ext, syms[$symid])
     }).collect::<Vec<_>>();
 
-    let (reg_alt, l0_rules): (Vec<_>, Vec<_>) = reg_dedup.into_iter().unzip();
+    // let (reg_alt, l0_rules): (Vec<_>, Vec<_>) = reg_dedup.into_iter().unzip();
 
-    l0_discard_rules.push(format!("({})", reg_alt.connect(")|(")));
-    let reg_alt_s = l0_discard_rules.connect("|");
-    let reg_alt = reg_alt_s.as_slice();
-    debug!("Lexer regexstr: {}", reg_alt_s);
+    // l0_discard_rules.push(format!("({})", reg_alt.connect(")|(")));
+    // let reg_alt_s = l0_discard_rules.connect("|");
+    // let reg_alt = reg_alt_s.as_slice();
+    // debug!("Lexer regexstr: {}", reg_alt_s);
 
     let num_syms = ctxt.syms.len();
 
@@ -676,7 +684,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         }
     }).collect::<Vec<_>>();
 
-    // ``` if tok_kind == 0 { $block } ... ```
+    // ``` if tok_kind == 0 { $block } else if ... ```
     let lex_cond_expr = ctxt.build_conditional(l0_inline_actions);
 
     // RULES -- G1
@@ -762,15 +770,14 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         }
         grammar.precompute().unwrap();
 
-        let scanner = regex!($reg_alt);
-        (grammar, scan_syms, rule_ids, scanner)
+        (grammar, scan_syms, rule_id)
     });
 
     let fn_parse_expr = quote_expr!(ctxt.ext, {
         let mut recce = ::marpa::Recognizer::new(&mut self.grammar).unwrap();
         recce.start_input();
 
-        let ns = precise_time_ns();
+        let lex_parse = self.lexer.new_parse(input);
 
         let mut positions = vec![];
 
@@ -783,29 +790,25 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             positions.push((start_pos as u32, end_pos as u32, pos));
         }
 
-        println!("regex: elapsed {}", (precise_time_ns() - ns) as f64 / 1_000_000_000f64);
-
-        let ns = precise_time_ns();
-
-        for (nth, &(start_pos, end_pos, pos)) in positions.iter().enumerate() {
-            recce.alternative(self.scan_syms[pos], nth as i32 + 1, 1); // 0 is reserved
+        for (nth, group) in lex_parse.tokens_iter() {
+             // 0 is reserved
+            recce.alternative(self.scan_syms[group], nth as i32 + 1, 1);
             recce.earleme_complete();
         }
 
         let latest_es = recce.latest_earley_set();
 
-        let mut tree = ::marpa::Bocage::new(&mut recce, latest_es).and_then(|mut bocage|
+        let mut tree =
+            ::marpa::Bocage::new(&mut recce, latest_es)
+         .and_then(|mut bocage|
             ::marpa::Order::new(&mut bocage)
         ).and_then(|mut order|
             ::marpa::Tree::new(&mut order)
         );
 
-        println!("marpa: elapsed {}", (precise_time_ns() - ns) as f64 / 1_000_000_000f64);
-
         SlifParse {
             tree: tree.unwrap(),
-            positions: positions,
-            input: input,
+            lex_parse: lex_parse,
             stack: vec![],
             parent: self,
         }
@@ -822,22 +825,11 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         }
 
         loop {
-            let (i, el) = match valuator.step() {
+            match valuator.step() {
                 Step::StepToken => {
                     let idx = valuator.token_value() as usize - 1;
-                    // let (end_pos, tok_kind) = if start_pos == 0 {
-                    //     self.positions[0]
-                    // } else {
-                        // println!("{:?} in {:?}", start_pos, self.positions);
-                        // let end_idx = self.positions.binary_search_by(|&(el, _)| el.cmp(&start_pos))
-                        //                             .unwrap_or_else(|x| x - 1) + 1;
-                    //     self.positions[end_idx]
-                    // };
-                    let (start_pos, end_pos, tok_kind) = self.positions[idx];
-                    (valuator.result() as usize,
-                     self.parent.lex_closure.call((self.input.slice(start_pos as usize,
-                                                                    end_pos as usize),
-                                                   tok_kind)))
+                    let elem = self.parent.lex_closure.call(self.lex_parse.token(idx));
+                    self.stack_put(valuator.result() as usize, elem);
                 }
                 Step::StepRule => {
                     let rule = valuator.rule();
@@ -848,25 +840,23 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     let elem = self.parent.rules_closure.call((slice,
                                                                choice.expect("unknown rule")));
                     match elem {
-                        SlifRepr::Continue => continue,
-                        other_elem => (arg_0, other_elem),
+                        SlifRepr::Continue => {
+                            continue
+                        }
+                        other_elem => {
+                            self.stack_put(arg_0, other_elem);
+                        }
                     }
                 }
                 Step::StepInactive | Step::StepNullingSymbol => {
                     break;
                 }
                 other => panic!("unexpected step {:?}", other),
-            };
-
-            if i == self.stack.len() {
-                self.stack.push(el);
-            } else {
-                self.stack[i] = el;
             }
         }
 
-        let result = self.stack.swap_remove(0);
-        self.stack.clear();
+        let result = self.stack.drain().next().unwrap();
+
         match result {
             $match_ty_return_val => Some(val),
             _ => None
@@ -880,7 +870,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
     let mut variants = ctxt.explicit_tys.iter().map(|(ty, n_ty)| {
         let n_ty_s = format!("Spec{}", n_ty);
-        let variant_name = token::str_to_ident(n_ty_s.as_slice());
+        let variant_name = token::str_to_ident(&n_ty_s[]);
         quote_tokens!(ctxt.ext, $variant_name($ty),)
     }).collect::<Vec<_>>();
 
@@ -895,12 +885,12 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         variants.push(quote_tokens!(ctxt.ext, ValStrSlice(&'a str),));
     }
 
-    let repr_enum = quote_item!(ctxt.ext,
-        enum SlifRepr<'a, $T> {
-            Continue, // also a placeholder
-            $variants
-        }
-    );
+    // let repr_enum = quote_item!(ctxt.ext,
+    //     enum SlifRepr<'a, $T> {
+    //         Continue, // also a placeholder
+    //         $variants
+    //     }
+    // );
 
     // let test_pat = quote_pat!(ctxt.ext, foo);
     // let test_pat = quote_block!(ctxt.ext, foo);
@@ -910,47 +900,59 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         use marpa::marpa::Values;
         use std::mem;
 
+        regex_scanner!($reg_alts);
+
         struct SlifGrammar<'a, C, D, $T> {
             grammar: ::marpa::Grammar,
             scan_syms: [Symbol; $num_scan_syms],
             rule_ids: [Rule; $num_rules],
-            scanner: ::regex::Regex,
+            lexer: Lexer,
             rules_closure: C,
             lex_closure: D,
         }
 
         struct SlifParse<'a, 'b, 'l, C: 'b, D: 'b, $T> {
             tree: Tree,
-            positions: Vec<(u32, u32, usize)>,
-            input: &'a str,
+            lex_parse: LexerParse<'a>,
             stack: Vec<SlifRepr<'a, $T>>,
             parent: &'b SlifGrammar<'l, C, D, $T>,
         }
 
-        $repr_enum
+        enum SlifRepr<'a, $T> {
+            Continue, // also a placeholder
+            $variants
+        }
 
         impl<'a, C, D, $T> SlifGrammar<'a, C, D, $T>
                 where C: for<'c> Fn(&mut [SlifRepr<'c, $T>], usize) -> SlifRepr<'c, $T>,
                       D: for<'c> Fn(&'c str, usize) -> SlifRepr<'c, $T> {
             #[inline]
             fn new(rules_closure: C, lex_closure: D) -> SlifGrammar<'a, C, D, $T> {
-                // $test
-
-                let (grammar, ssym, rid, scanner) = $fn_new_expr;
+                let (grammar, ssym, rid) = $fn_new_expr;
                 SlifGrammar {
                     grammar: grammar,
                     scan_syms: ssym,
                     rule_ids: rid,
-                    scanner: scanner,
+                    lexer: Lexer::new(),
                     rules_closure: rules_closure,
                     lex_closure: lex_closure,
                 }
             }
+
             #[inline]
             fn parses_iter<'b, 'c>(&'c mut self, input: &'b str) -> SlifParse<'b, 'c, 'a, C, D, $T> {
                 $fn_parse_expr
             }
+
+            fn stack_put(&mut self, idx: usize, elem: SlifRepr<'a, $T>) {
+                if idx == self.stack.len() {
+                    self.stack.push(elem);
+                } else {
+                    self.stack[idx] = elem;
+                }
+            }
         }
+
         impl<'a, 'b, 'l, C, D, $T> Iterator for SlifParse<'a, 'b, 'l, C, D, $T>
                 where C: for<'c> Fn(&mut [SlifRepr<'c, $T>], usize) -> SlifRepr<'c, $T>,
                       D: for<'c> Fn(&'c str, usize) -> SlifRepr<'c, $T> {
@@ -960,6 +962,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 $slif_iter_next_expr
             }
         }
+
         SlifGrammar::new(
             |args, choice_| {
                 $rule_cond_expr
