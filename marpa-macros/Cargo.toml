@@ -5,11 +5,9 @@ version = "0.0.1"
 authors = [ "pioczarn@gmail.com" ]
 
 [lib]
-name = "marpa-macros"
+name = "marpa_macros"
 crate_type = ["dylib"]
 plugin = true
 
 [dependencies.rust-marpa]
 path = ".."
-
-[dependencies.regex_macros]

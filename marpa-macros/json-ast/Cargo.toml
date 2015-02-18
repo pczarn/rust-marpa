@@ -11,6 +11,9 @@ path = "json-ast.rs"
 [dependencies.rust-marpa-macros]
 path = ".."
 
+[dependencies.regex-scanner]
+path = "../../regex-scanner"
+
 [dependencies.rust-marpa]
 path = "../.."
 

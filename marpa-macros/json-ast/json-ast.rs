@@ -1,12 +1,12 @@
 #![feature(plugin, unboxed_closures, associated_types)]
+#![plugin(regex_macros, marpa_macros, regex_scanner)]
 
-#[plugin]
-extern crate "marpa-macros" as marpa_macros;
+extern crate marpa_macros;
+extern crate regex_scanner;
 
 extern crate marpa;
 extern crate regex;
 
-#[plugin]
 #[no_link]
 extern crate regex_macros;
 
@@ -20,7 +20,7 @@ use time::precise_time_ns;
 
 use self::Json::*;
 
-#[derive(Show)]
+#[derive(Debug)]
 enum Json {
     I64(i64),
     U64(u64),
