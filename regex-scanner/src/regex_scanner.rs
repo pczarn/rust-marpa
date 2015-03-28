@@ -6,12 +6,6 @@ extern crate rustc;
 extern crate syntax;
 #[macro_use] extern crate log;
 
-// extern crate regex;
-
-// use self::RuleRhs::*;
-// use self::KleeneOp::*;
-// use self::InlineActionType::*;
-
 use syntax::ast;
 use syntax::ast::TokenTree;
 use syntax::codemap::Span;
@@ -54,44 +48,26 @@ fn expand_regex_scanner(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         parser.expect(&token::Comma);
     }
 
-    // an array [origin_idx] => 
-    // let redir_ary = 
-
-    // regs[].sort_by(|&(_n1, ref s1), &(_n2, ref s2)| s1.cmp(s2));
-    // regs.dedup();
-
     let num_syms = regs.len();
 
     let (idxs, regs): (Vec<_>, Vec<_>) = regs.into_iter().map(|(n, s)| (n, s.to_string())).unzip();
 
-    // array of [final group] => origin idx
     let num_ary = cx.expr_vec(sp, idxs.into_iter().map(|i| cx.expr_usize(sp, i)).collect());
     let reg_ary = cx.expr_vec(sp, regs.into_iter().map(|r| {
         let r = &r[];
         quote_expr!(cx, regex!(concat!(r"\A", $r)))
-        // quote_expr!(cx, $r)
     }).collect());
 
-    // let mut l0_discard_rules = vec![];
-    // l0_discard_rules.push(format!("({})", regs.connect(")|(")));
-    // let reg_alt_s = l0_discard_rules.connect("|");
-    // let reg_alt = &reg_alt_s[];
-
-    // debug!("Lexer regexstr: {}", reg_alt_s);
-
-    // let num_syms: usize = 0;
     let discard = discard.as_ref().map(|s| &s[]);
 
     let lexer_mod = quote_item!(cx,
-        mod lexer {
+        pub mod regex_scanner {
             use regex::Regex;
             use std::vec::IntoIter;
             use std::iter::FilterMap;
 
             pub type Input<'a> = &'a str;
-
-            // pub static NUM_SYMS: usize = $num_syms;
-            // pub static SYMS: &'static [usize] = &$num_ary;
+            pub type Output<'a> = &'a str;
 
             pub struct Lexer {
                 reg: [Regex; $num_syms],
@@ -103,7 +79,6 @@ fn expand_regex_scanner(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 discard: &'b Regex,
                 input: &'a str,
                 offset: usize,
-                // positions: Vec<(u32, u32, usize)>,
             }
 
             pub struct Token {
@@ -120,7 +95,6 @@ fn expand_regex_scanner(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
             impl Lexer {
                 pub fn new() -> Lexer {
-                    // println!("{:?}", $reg_ary);
                     Lexer {
                         reg: $reg_ary,
                         discard: regex!(concat!(r"\A", $discard)),
@@ -128,9 +102,6 @@ fn expand_regex_scanner(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 }
 
                 pub fn new_parse<'a, 'b>(&'b self, input: &'a str) -> LexerParse<'a, 'b> {
-                    // for reg in self.reg.iter() {
-                    //     println!("{}", reg.as_str());
-                    // }
                     LexerParse {
                         reg: &self.reg,
                         discard: &self.discard,
@@ -142,20 +113,9 @@ fn expand_regex_scanner(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
 
             impl<'a, 'b> LexerParse<'a, 'b> {
-                // pub fn tokens_iter(&mut self) -> FilterMap<u8> {
-                //     self.reg.captures_iter(input).filter_map(|capture| {
-                //         capture.iter_pos().skip(1).enumerate().find(|(_n, (p1, p2))| p1 != p2)
-                //                                               .map(|(group, (start_pos, end_pos))|
-                //             (group as i32, (start_pos as u32, end_pos as u32))
-                //         )
-                //     })
-                // }
-
-                // LATM
+                // for LATM
                 pub fn longest_parses_iter(&mut self, accept: &[u32])
                                            -> Option<IntoIter<Token>> {
-                    // println!("{}", self.offset);
-                    // println!("{:?}", accept);
                     while let Some((begin, end)) = self.discard.find(&self.input[self.offset..]) {
                         debug_assert_eq!(begin, 0);
                         self.offset += end;
@@ -205,7 +165,8 @@ fn expand_regex_scanner(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     self.offset == self.input.len()
                 }
 
-                pub fn get(&self, tok: &Token) -> (&'a str, usize) {
+                pub fn get(&self, toks: &[Token], idx: usize) -> (&'a str, usize) {
+                    let tok = &toks[idx];
                     (&self.input[tok.begin as usize .. tok.end as usize], tok.sym())
                 }
             }

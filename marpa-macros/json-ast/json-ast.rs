@@ -104,7 +104,7 @@ fn main() {
     for json_file in args().iter().skip(1) {
         let contents = File::open(&Path::new(json_file.as_slice())).read_to_string().unwrap();
 
-        let mut iter = json.parses_iter(contents.as_slice());
+        let mut iter = json.parses_iter(&contents[]);
 
         let ns = precise_time_ns();
 
@@ -119,3 +119,46 @@ fn main() {
     //     println!("{:?}", ast);
     // }
 }
+
+        // start ::= collection ;
+
+        // collection ::=
+        //     r"\{" map:[ string ":" value ]{","}* r"\}" -> Json {
+        //         Object(map)
+        //     }
+        //     | r"\[" values:[ value ]{","}* r"\]" -> Json {
+        //         Array(values)
+        //     } ;
+
+        // value ::=
+        //     s:string -> Json { JsonString(s) }
+        //     | "true" -> _ { Boolean(true) }
+        //     | "false" -> _ { Boolean(false) }
+        //     | "null" -> _ { Null }
+        //     | collection
+        //     | signed
+        //     | unsigned ;
+
+        // signed ::=
+        //     "-" F64(fp):unsigned -> Json {
+        //         F64(-fp)
+        //     }
+        //     | "-" U64(i):unsigned -> _ {
+        //         I64(-i as i64)
+        //     } ;
+
+        // unsigned ::=
+        //     Some(i):integer Some(fp):frac_part -> Json {
+        //         F64(i as f64 + fp)
+        //     }
+        //     | Some(i):integer -> _ {
+        //         U64(i)
+        //     } ;
+
+        // frac_part ::= f:r"\.\d+(?:[eE][-+]?)?\d*" -> Option<f64> { f.parse() } ;
+
+        // integer ::= i:r"\d+" -> Option<u64> { i.parse() } ;
+
+        // string ~ "\"" s:r#"(?:\\"|[^"])*"# "\"" -> String { s.to_string() } ;
+
+        // discard ~ r"\s" ;
