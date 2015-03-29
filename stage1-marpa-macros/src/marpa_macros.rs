@@ -143,6 +143,11 @@ impl Rule {
     }
 }
 
+fn repr_variant(n: u32) -> Ident {
+    let variant_name = format!("Spec{}", n);
+    token::str_to_ident(&variant_name[..])
+}
+
 fn quote_block(cx: &mut ExtCtxt, toks: Vec<Token>) -> P<Block> {
     let tts: Vec<TokenTree> = toks.into_iter().map(|t| TtToken(DUMMY_SP, t)).collect();
     cx.block_expr(quote_expr!(cx, { $tts }))
@@ -333,9 +338,10 @@ fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, 
         l0_stmt ::=
             i:ident squiggly (mut rhs):paren_bracket_tts ty:rtype b:inline_action semi -> L0Rule {
                 let pat = if rhs[1] == Colon {
+                    let p = quote_pat(cx, rhs.clone());
                     rhs.remove(0);
                     rhs.remove(0);
-                    Some(quote_pat(cx, rhs.clone()))
+                    Some(p)
                 } else {
                     None
                 };
@@ -569,13 +575,13 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             ast.rules.iter().map(|r| &r.ty)
                 .chain(ast.l0_rules.iter().map(|r| &r.ty))
                 .enumerate().map(|(n, ty)| {
-        let variant_name = format!("Spec{}", n);
-        (token::str_to_ident(&variant_name[..]), ty.clone())
+        (repr_variant(n as u32), ty.clone())
     }).unzip();
 
     let num_syms = ast.rules.len() + ast.l0_rules.len();
     let num_scan_syms = ast.l0_rules.len();
     let num_rules = ast.rules.iter().map(|rule| rule.rhs.len()).sum();
+    let num_rules_offset = ast.rules.len() as u32;
 
     let rules = ast.rules.iter().flat_map(|rule| {
         rule.rhs.iter().map(|alt| {
@@ -586,13 +592,13 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 };
 
                 let (k, n) = namespace[name];
-                if k == 1 { n + num_rules as u32 } else { n }
+                if k == 1 { n as usize + num_rules_offset as usize } else { n as usize }
             }).collect::<Vec<_>>()
         })
     }).collect::<Vec<_>>();
 
     let rule_names = ast.rules.iter().flat_map(|rule| {
-        iter::repeat(namespace[rule.name].1).take(rule.rhs.len())
+        iter::repeat(namespace[rule.name].1 as usize).take(rule.rhs.len())
     }).collect::<Vec<_>>();
 
     let ty_return = ast.rules[0].ty.clone();
@@ -601,6 +607,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     // let mut lex_tup_arg = vec![];
     let mut lex_tup_pat = vec![];
     let mut lex_action = vec![];
+    let mut lex_action_c = vec![];
     let mut lexer_tts = vec![];
     let mut discard_rule = discard_rule.map(|rule| quote_tokens(cx, rule.rhs));
 
@@ -614,6 +621,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         // lex_tup_pat.push(rule.pat.iter().cloned().collect());
         lex_tup_pat.push(rule.pat.clone().unwrap_or_else(|| cx.pat_wild(sp)));
         lex_action.push(rule.action.block.clone().unwrap());
+        lex_action_c.push(repr_variant(nth as u32 + num_rules_offset as u32));
         lexer_tts.push(quote_tokens(cx, rule.rhs.clone()));
     }
 
@@ -621,14 +629,21 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     let mut rule_tup_nth = vec![];
     let mut rule_tup_pat = vec![];
     let mut rule_action = vec![];
+    let mut rule_action_c = vec![];
 
     for (n, subrule) in ast.rules.iter().flat_map(|r| r.rhs.iter()).enumerate() {
         rule_cond_n.push(n);
         let (tup_nth, tup_pat): (Vec<usize>, Vec<P<Pat>>) =
         subrule.inner.iter().enumerate().filter_map(|(nth, expr)| {
             match expr {
-                &Tagged(ref t) =>
-                    Some((nth, t.pat.clone())),
+                &Tagged(ref t) => {
+                    let (a, b) = namespace[t.name.ident.name];
+                    let b = if a == 1 { b + num_rules_offset } else { b };
+                    let variant_name = repr_variant(b);
+                    let pat = t.pat.clone();
+                    let pat = quote_pat!(cx, Repr::$variant_name($pat));
+                    Some((nth, pat))
+                }
                 &Untagged(ref t) =>
                     None,
             }
@@ -638,42 +653,49 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         rule_action.push(subrule.action.block.clone().unwrap());
     }
 
+    for (n, r) in ast.rules.iter().enumerate() {
+        for _ in 0..r.rhs.len() {
+            rule_action_c.push(repr_variant(n as u32));
+        }
+    }
+
+
+
     // let (lexer, lexer_opt) = ast.options.iter().find(|opt| opt.ident.as_str() == "").unwrap_or_else(|| (token::str_to_ident("regex_scanner"), vec![]));
     let (lexer, lexer_opt) = ast.options.iter().map(|o| (o.ident, o.tokens.clone())).next().unwrap_or_else(|| (token::str_to_ident("regex_scanner"), vec![]));
     // let lexer_opt = 
 
-    // quote the code
-    let grammar_expr = quote_expr!(cx, {
-        trait Lexer {
-            type Par;
-            type Tok;
-            type Inp;
-            type Out;
-        }
+    let Token = gensym_ident("Token_");
 
+    // quote the code
+    let grammar_expr = quote_tokens!(cx, {
         enum Repr<'a> {
             Continue, // also a placeholder
+            Unused(PhantomData<&'a ()>),
             $( $variant_names($variant_tys), )*
         }
 
-        struct Grammar<F, G, L: Lexer> {
+        struct Grammar<F, G, L> {
             grammar: ::marpa::Grammar,
             scan_syms: [::marpa::Symbol; $num_scan_syms],
             rule_ids: [::marpa::Rule; $num_rules],
             lexer: L,
             lex_closure: F,
-            parse_closure: G,
+            eval_closure: G,
         }
 
-        struct Parses<'a, 'b, F: 'b, G: 'b, L: Lexer + 'b> {
+        struct Parses<'a, 'b, F: 'b, G: 'b, L: 'b> {
             tree: ::marpa::Tree,
-            lex_parse: L::Par,
-            positions: Vec<L::Tok>,
+            lex_parse: LPar<'a, 'b>,
+            positions: Vec<$Token>,
             stack: Vec<Repr<'a>>,
             parent: &'b mut Grammar<F, G, L>,
         }
 
-        impl<F, G, L: Lexer> Grammar<F, G, L> {
+        impl<F, G, L: Lexer> Grammar<F, G, L>
+            where F: for<'c> FnMut(LOut<'c>, usize) -> Repr<'c>,
+                  G: for<'c> FnMut(&mut [Repr<'c>], usize) -> Repr<'c>,
+        {
             fn new(lexer: L, lex_closure: F, eval_closure: G) -> Grammar<F, G, L> {
                 use marpa::{Config, Symbol, Rule};
                 let mut cfg = Config::new();
@@ -691,7 +713,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 }
 
                 let rules: [(Symbol, &[Symbol]); $num_rules] = [ $(
-                    ($rule_names,
+                    (syms[$rule_names],
                      &[ $(
                         syms[$rules],
                      )* ]),
@@ -715,8 +737,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
 
             #[inline]
-            fn parses_iter<'a, 'b>(&'b mut self, input: L::Inp) -> Parses<'a, 'b, F, G> {
-                use marpa::{Recognizer, Bocage, Order, Tree};
+            fn parses_iter<'a, 'b>(&'b mut self, input: LInp<'a>) -> Parses<'a, 'b, F, G, L> {
+                use marpa::{Recognizer, Bocage, Order, Tree, Symbol, ErrorCode};
                 let mut recce = Recognizer::new(&mut self.grammar).unwrap();
                 recce.start_input();
 
@@ -780,17 +802,20 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
         }
 
-        impl<'a, 'b, F, G, L: Lexer> Parses<'a, 'b, F, G, L>
-            where F: for<'c> FnMut(L::Out<'c>, usize) -> Repr<'c>,
+        impl<'a, 'b, F, G, L> Iterator for Parses<'a, 'b, F, G, L>
+            where F: for<'c> FnMut(LOut<'c>, usize) -> Repr<'c>,
                   G: for<'c> FnMut(&mut [Repr<'c>], usize) -> Repr<'c>,
         {
+            type Item = $ty_return;
+
             fn next(&mut self) -> Option<$ty_return> {
+                use marpa::{Step, Value};
                 let mut valuator = if self.tree.next() >= 0 {
                     Value::new(&mut self.tree).unwrap()
                 } else {
                     return None;
                 };
-                for &rule in &self.parent.rule_ids {
+                for &rule in self.parent.rule_ids.iter() {
                     valuator.rule_is_valued_set(rule, 1);
                 }
 
@@ -808,11 +833,11 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                             let elem = {
                                 let slice = self.stack.slice_mut(arg_0, arg_n + 1);
                                 let choice = self.parent.rule_ids.iter().position(|r| *r == rule);
-                                self.parent.parse_closure.call_mut((slice,
+                                self.parent.eval_closure.call_mut((slice,
                                                                     choice.expect("unknown rule")))
                             };
                             match elem {
-                                SlifRepr::Continue => {
+                                Repr::Continue => {
                                     continue
                                 }
                                 other_elem => {
@@ -830,7 +855,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 let result = self.stack.drain().next();
 
                 match result {
-                    Some(Spec0(val)) =>
+                    Some(Repr::Spec0(val)) =>
                         Some(val),
                     _ =>
                         None,
@@ -838,7 +863,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
         }
 
-        impl<'a, 'b, F, G> Parses<'a, 'b, F, G> {
+        impl<'a, 'b, F, G, L> Parses<'a, 'b, F, G, L> {
             fn stack_put(&mut self, idx: usize, elem: Repr<'a>) {
                 if idx == self.stack.len() {
                     self.stack.push(elem);
@@ -849,33 +874,35 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         }
 
         Grammar::new(
-            $lexer!($lexer_opt ; $($($discard_rule)*)*, $( $lexer_tts, )*),
+            new_lexer(),
             |arg_, choice_| {
-                let args: &[_] = &[arg_];
-                $(if choice_ == $lex_cond_n {
-                    match (args,) {
-                        ($lex_tup_pat,) => Some({ $lex_action }),
-                        _ => None
-                    }
-                })else+
+                // let args: &[_] = &[arg_];
+                let r = match (true, arg_) {
+                    $((true, $lex_tup_pat) if choice_ == $lex_cond_n => Some(Repr::$lex_action_c({ $lex_action })),)*
+                    _ => None
+                };
+                r.unwrap()
             },
-            |args, choice_| {
-                $(if choice_ == $rule_cond_n {
-                    match ( $( mem::replace(&mut args[$rule_tup_nth], Repr::Continue), )* ) {
-                        ( $( $rule_tup_pat, )* ) => Some({ $rule_action }),
-                        _ => None
+            |args: &mut [Repr], choice_| {
+                let r = $(
+                    if choice_ == $rule_cond_n {
+                        match ( true, $( mem::replace(&mut args[$rule_tup_nth], Repr::Continue), )* ) {
+                            ( true, $( $rule_tup_pat, )* ) => Some(Repr::$rule_action_c({ $rule_action })),
+                            _ => None
+                        }
                     }
-                })else+
+                )else+
+                else {
+                    None
+                };
+                r.unwrap()
             },
         )
     });
 
-        // enum SlifRepr<'a, $T> {
-        //     Continue, // also a placeholder
-        //     $variants
-        // }
+    let grammar_expr = quote_expr!(cx, {
+        $lexer!($Token $lexer_opt ; $($($discard_rule)*)*, $( $lexer_tts, )* ; $grammar_expr)
+    });
 
-    // unreachable!();
     MacEager::expr(grammar_expr)
-    // return mac;
 }

@@ -830,15 +830,15 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 None => break
             };
 
-            println!("#{}", iter.len());
+            // println!("#{}", iter.len());
             for token in iter {
                 let expected: Vec<&str> = terminals_expected.iter().map(|&i| l0_names[i as usize]).collect();
                 match recce.alternative(self.scan_syms[token.sym()], positions.len() as i32 + 1, 1) {
                     ErrorCode::UnexpectedTokenId => {
-                        println!("{}: expected {:?}, but found {}", ith, expected, l0_names[token.sym()]);
+                        // println!("{}: expected {:?}, but found {}", ith, expected, l0_names[token.sym()]);
                     }
                     _ => {
-                        println!("{}: expected {:?}, ACCEPTED {}", ith, expected, l0_names[token.sym()]);
+                        // println!("{}: expected {:?}, ACCEPTED {}", ith, expected, l0_names[token.sym()]);
                     }
                 }
                 positions.push(token); // TODO optimize
