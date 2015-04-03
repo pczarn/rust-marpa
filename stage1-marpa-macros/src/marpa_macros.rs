@@ -108,6 +108,7 @@ struct SeqRule {
 
 struct ExtractionContext<'a, 'b: 'a> {
     namespace: &'a mut HashMap<ast::Name, (u32, u32)>,
+    l0_types: Vec<P<Ty>>,
     types: Vec<P<Ty>>,
     sp: Span,
     ext: &'a mut ExtCtxt<'b>,
@@ -124,19 +125,6 @@ impl Rule {
 
                 new_rules.extend(r.into_iter());
                 new_seq_rules.extend(s.into_iter());
-                // match expr {
-                //     &mut ExprOptional(inner) => {
-                //         let (ty, n_r, n_seq) = inner.extract();
-                //         let name = gensym_ident("");
-                //         new_rules.push(Rule {
-                //             name: name,
-                //             ty: quote_ty!(cx, Option<$ty>),
-                //             rhs: vec![
-
-                //             ],
-                //         });
-                //     }
-                // }
             }
         }
 
@@ -145,26 +133,26 @@ impl Rule {
 }
 
 impl Expr {
-    // Transforms an expr into Tagged or Untagged
+    // Transforms an expr into NameExpr
     fn extract(&mut self, cx: &mut ExtractionContext) -> (P<Ty>, Vec<Rule>, Vec<SeqRule>) {
         let mut replace_with = None;
         let mut v_rules = vec![];
         let mut v_seq_rules = vec![];
 
         let tup = match self {
-            &mut Tagged(ref tagged) => {
-                (cx.types[cx.namespace[tagged.name.ident.name].1 as usize].clone(), vec![], vec![])
-            }
-            &mut Untagged(ref name_expr) => {
-                (cx.types[cx.namespace[name_expr.ident.name].1 as usize].clone(), vec![], vec![])
+            &mut NameExpr(name) => {
+                let (kind, n) = cx.namespace[name];
+                let n = n as usize;
+                let ty = if kind == 1 { cx.types[n].clone() } else { cx.l0_types[n].clone() };
+                (ty, vec![], vec![])
             }
             &mut ExprOptional(ref mut inner) => {
                 let (inner_ty, new_r, new_seq) = inner.extract(cx);
                 v_rules.extend(new_r.into_iter());
                 v_seq_rules.extend(new_seq.into_iter());
-                let pat_ident = gensym_ident("");
+                let pat_ident = gensym_ident("_pat_");
                 let pat = cx.ext.pat_ident(cx.sp, pat_ident);
-                let name = gensym_ident("");
+                let name = gensym_ident("_name_");
                 let ty = quote_ty!(cx.ext, Option<$inner_ty>);
 
                 v_rules.push(Rule {
@@ -172,18 +160,15 @@ impl Expr {
                     ty: ty.clone(),
                     rhs: vec![
                         Alternative {
-                            inner: vec![Tagged(TaggedExpr {
-                                pat: pat,
-                                name: NameExpr {
-                                    ident: inner.ident(),
-                                }
-                            })],
+                            inner: vec![NameExpr(inner.name())],
+                            pats: vec![(0, pat)],
                             action: InlineAction {
                                 block: Some(cx.ext.block_expr(cx.ext.expr_some(cx.sp, cx.ext.expr_ident(cx.sp, pat_ident)))),
                             }
                         },
                         Alternative {
                             inner: vec![],
+                            pats: vec![],
                             action: InlineAction {
                                 block: Some(cx.ext.block_expr(cx.ext.expr_none(cx.sp))),
                             }
@@ -191,7 +176,7 @@ impl Expr {
                     ],
                 });
 
-                replace_with = Some(Untagged(NameExpr { ident: name }));
+                replace_with = Some(NameExpr(name.name));
 
                 (ty, v_rules, v_seq_rules)
             }
@@ -205,48 +190,19 @@ impl Expr {
                     v_seq_rules.extend(b.into_iter());
                 }
 
-                let name = gensym_ident("");
-                let name_body = gensym_ident("");
-                let name_sep = gensym_ident("");
+                let name = gensym_ident("_name_");
+                let name_body = gensym_ident("_name_body_");
+                let name_sep = gensym_ident("_name_sep_");
 
-                let v_body = mem::replace(body, vec![]);
+                let mut v_body = mem::replace(body, vec![]);
+                let mut v_pats = vec![];
 
-                // make: action
-                let num_tagged = v_body.iter().filter_map(|e|
-                    if let &Tagged(_) = e {
-                        Some(())
-                    } else {
-                        None
-                    }
-                ).count();
-
-                let num_ignored = v_body.iter().filter_map(|e|
-                    if let &Tagged(ref t) = e {
-                        if t.pat.node == ast::PatWild(ast::PatWildSingle) {
-                            Some(())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                ).count();
-
-                let (v_body, action, inner_ty) =
-                if v_body.len() == 1 && num_tagged == 0 && num_ignored == 0 {
-                    let pat_ident = gensym_ident("");
-                    let v_body = vec![Tagged(TaggedExpr {
-                        pat: cx.ext.pat_ident(cx.sp, pat_ident),
-                        name: NameExpr {
-                            ident: v_body[0].ident(),
-                        },
-                    })];
-                    (v_body, InlineAction { block: Some(cx.ext.block_expr(cx.ext.expr_ident(cx.sp, pat_ident))) }, v_body_ty.pop().unwrap())
-                // } else if num_tagged > num_ignored {
-                //     // struct
-
+                let (action, inner_ty) = if v_body.len() == 1 {
+                    let pat_ident = gensym_ident("_pat_ident_");
+                    v_pats.push((0, cx.ext.pat_ident(cx.sp, pat_ident)));
+                    (InlineAction { block: Some(cx.ext.block_expr(cx.ext.expr_ident(cx.sp, pat_ident))) },
+                     v_body_ty.pop().unwrap())
                 } else {
-                    // tuple
                     unreachable!()
                 };
 
@@ -256,6 +212,7 @@ impl Expr {
                     rhs: vec![
                         Alternative {
                             inner: v_body,
+                            pats: v_pats,
                             action: action,
                         }
                     ],
@@ -267,6 +224,7 @@ impl Expr {
                     rhs: vec![
                         Alternative {
                             inner: mem::replace(sep, vec![]),
+                            pats: vec![],
                             action: InlineAction { block: Some(cx.ext.block_expr(cx.ext.expr_tuple(cx.sp, vec![]))) },
                         }
                     ],
@@ -281,7 +239,7 @@ impl Expr {
                     sep: name_sep.name,
                 });
 
-                replace_with = Some(Untagged(NameExpr { ident: name }));
+                replace_with = Some(NameExpr(name.name));
 
                 (ty, v_rules, v_seq_rules)
             }
@@ -296,16 +254,7 @@ impl Expr {
 
     fn name(&self) -> ast::Name {
         match self {
-            &Tagged(ref e) => e.name.ident.name,
-            &Untagged(ref e) => e.ident.name,
-            _ => unreachable!()
-        }
-    }
-
-    fn ident(&self) -> ast::Ident {
-        match self {
-            &Tagged(ref e) => e.name.ident,
-            &Untagged(ref e) => e.ident,
+            &NameExpr(name) => name,
             _ => unreachable!()
         }
     }
@@ -340,7 +289,9 @@ pub enum RustToken {
     Tok(Token)
 }
 
-fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, (u32, u32)>, Option<L0Rule>) {
+fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, (u32, u32)>, Option<L0Rule>) {
+    type Alt = (Vec<Expr>, Vec<(usize, P<Pat>)>);
+
     let mut grammar = grammar! {
         enum_adaptor!(RustToken);
 
@@ -397,15 +348,15 @@ fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, 
             } ;
 
         list -> Alternative ::=
-            (v, v2):pat_expr_list b:inline_action {
-                Alternative { inner: v, pats: v2, action: b, }
+            v:pat_expr_list b:inline_action {
+                Alternative { inner: v.0, pats: v.1, action: b, }
             } ;
 
-        pat_expr_list -> (Vec<Expr>, Vec<(usize, P<Pat>)>) ::=
+        pat_expr_list -> Alt ::=
             a:atom {
                 let mut v = Vec::new();
                 v.push(a);
-                v
+                (v, Vec::new())
             }
             | pat:bind_pat a:atom {
                 let mut v = Vec::new();
@@ -414,11 +365,11 @@ fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, 
                 v2.push((0, pat.unwrap()));
                 (v, v2)
             }
-            | (mut v, mut v2):pat_expr_list a:atom {
+            | ((mut v, mut v2)):pat_expr_list a:atom {
                 v.push(a);
                 (v, v2)
             }
-            | (mut v, mut v2):pat_expr_list pat:bind_pat a:atom {
+            | ((mut v, mut v2)):pat_expr_list pat:bind_pat a:atom {
                 v2.push((v.len(), pat.unwrap()));
                 v.push(a);
                 (v, v2)
@@ -436,19 +387,8 @@ fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, 
             } ;
 
         atom -> Expr ::=
-            pat:bind_pat i:ident {
-                match pat {
-                    Some(pat) =>
-                        Tagged(TaggedExpr {
-                            pat: pat,
-                            name: NameExpr { ident: i }
-                        }),
-                    None =>
-                        Untagged(NameExpr { ident: i }),
-                }
-            }
-            | i:ident {
-                Untagged(NameExpr { ident: i })
+            i:ident {
+                NameExpr(i.name)
             }
             | a:atom question {
                 ExprOptional(box a)
@@ -492,11 +432,8 @@ fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, 
             } ;
 
         path -> ast::Path ::=
-            mod_sep ps:path_segments {
-                ast::Path { global: true, segments: ps, span: DUMMY_SP }
-            }
-            | ps:path_segments {
-                ast::Path { global: false, segments: ps, span: DUMMY_SP }
+            global:mod_sep? ps:path_segments {
+                ast::Path { global: global.is_some(), segments: ps, span: DUMMY_SP }
             } ;
 
         path_segments -> Vec<PathSegment> ::=
@@ -717,12 +654,12 @@ fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, 
         for (n, rule) in ast.rules.drain().enumerate() {
             match namespace.entry(rule.name) {
                 Vacant(mut vacant) => {
-                    vacant.insert((0, rules.len() as u32));
+                    vacant.insert((1, rules.len() as u32));
                     rules.push(rule);
                 }
                 Occupied(mut occupied) => {
                     let &(x, y) = occupied.get();
-                    assert_eq!(x, 0);
+                    assert_eq!(x, 1);
                     rules[y as usize].rhs.extend(rule.rhs.into_iter());
                 }
             }
@@ -737,7 +674,7 @@ fn name(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, 
             }
             match namespace.entry(rule.name) {
                 Vacant(mut vacant) => {
-                    vacant.insert((1, rules.len() as u32));
+                    vacant.insert((0, rules.len() as u32));
                     rules.push(rule);
                 }
                 Occupied(mut occupied) => {
@@ -775,7 +712,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
     let mac = MacEager::expr(quote_expr!(cx, unreachable!()));
 
-    let (mut ast, mut namespace, discard_rule) = name(cx, &tokens[..]);
+    // call
+    let (mut ast, mut namespace, discard_rule) = parse_ast(cx, &tokens[..]);
 
     let rules_offset = ast.rules.len();
 
@@ -785,6 +723,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     {
         let mut cx = ExtractionContext {
             namespace: &mut namespace,
+            l0_types: ast.l0_rules.iter().map(|r| r.ty.clone()).collect(),
             types: ast.rules.iter().map(|r| r.ty.clone()).collect(),
             sp: sp,
             ext: cx,
@@ -793,7 +732,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         for rule in &mut ast.rules {
             let (new_rules, new_seqs) = rule.extract(&mut cx);
             for (n, new_rule) in new_rules.into_iter().enumerate() {
-                cx.namespace.insert(new_rule.name, (0, rules_offset as u32 + new_rules_tmp.len() as u32));
+                cx.namespace.insert(new_rule.name, (1, rules_offset as u32 + new_rules_tmp.len() as u32));
                 new_rules_tmp.push(new_rule);
             }
 
@@ -808,26 +747,28 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     }
 
     let (variant_names, variant_tys): (Vec<_>, Vec<_>) =
-            ast.rules.iter().map(|r| &r.ty)
-                .chain(ast.l0_rules.iter().map(|r| &r.ty))
+            ast.l0_rules.iter().map(|r| &r.ty)
+                .chain(ast.rules.iter().map(|r| &r.ty))
                 .chain(seq_rules.iter().map(|r| &r.ty))
                 .enumerate().map(|(n, ty)| {
         (repr_variant(n as u32), ty.clone())
     }).unzip();
 
-    let num_syms = ast.rules.len() + ast.l0_rules.len() + seq_rules.len();
+    let num_syms = ast.l0_rules.len() + ast.rules.len() + seq_rules.len();
     let num_scan_syms = ast.l0_rules.len();
-    let num_rules = ast.rules.iter().map(|rule| rule.rhs.len()).sum();
-    let num_rules_offset = ast.rules.len();
+    let num_rule_alts = ast.rules.iter().map(|rule| rule.rhs.len()).sum();
+    let num_rules = ast.rules.len();
     let num_seq_rules = seq_rules.len();
-    let num_all_rules = num_rules + num_seq_rules;
+    let num_rule_ids = num_rule_alts + num_seq_rules;
+    let offset_rules = ast.l0_rules.len();
+    let offset_seq_rules = ast.l0_rules.len() + ast.rules.len();
 
     // renumerate
     for (_, &mut (kind, ref mut nth)) in namespace.iter_mut() {
         if kind == 1 {
-            *nth += num_rules_offset as u32;
+            *nth += offset_rules as u32;
         } else if kind == 2 {
-            *nth += (num_rules_offset + num_scan_syms) as u32;
+            *nth += offset_seq_rules as u32;
         }
     }
 
@@ -841,11 +782,11 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
 
     // all produced sequences
     for (n, rule) in seq_rules.iter().enumerate() {
-        seq_rule_names.push(n);
-        seq_rule_rhs.push(namespace[rule.rhs].1 as usize /*+ num_rules_offset*/);
-        seq_rule_separators.push(namespace[rule.sep].1 as usize /*+ num_rules_offset*/);
-        rule_seq_cond_n.push(num_rules_offset + n);
-        rule_seq_action_c.push(repr_variant((n + num_rules_offset + num_scan_syms) as u32));
+        seq_rule_names.push(n + offset_seq_rules);
+        seq_rule_rhs.push(namespace[rule.rhs].1 as usize);
+        seq_rule_separators.push(namespace[rule.sep].1 as usize);
+        rule_seq_cond_n.push(num_rule_alts + n);
+        rule_seq_action_c.push(repr_variant((n + offset_seq_rules) as u32));
         rule_seq_value_c.push(repr_variant(namespace[rule.rhs].1));
     }
 
@@ -876,60 +817,65 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         lex_cond_n.push(nth);
         lex_tup_pat.push(rule.pat.clone().unwrap_or_else(|| cx.pat_wild(sp)));
         lex_action.push(rule.action.block.clone().unwrap());
-        lex_action_c.push(repr_variant(nth as u32 + num_rules_offset as u32));
+        lex_action_c.push(repr_variant(nth as u32));
         lexer_tts.push(quote_tokens(cx, rule.rhs.clone()));
     }
 
     let mut rule_cond_n = vec![];
     let mut rule_tup_nth = vec![];
+    let mut rule_tup_variant = vec![];
     let mut rule_tup_pat = vec![];
     let mut rule_action = vec![];
     let mut rule_action_c = vec![];
     let mut rule_nulling_offset: usize = 0;
 
-    let mut rule_nulling_rule_n = vec![];
+    let mut rule_nulling_rule_id = vec![];
     let mut rule_nulling_cond_n = vec![];
     let mut rule_nulling_action = vec![];
     let mut rule_nulling_action_c = vec![];
 
+    let mut i_n: usize = 0;
     for (nr, rule) in ast.rules.iter().enumerate() {
-        for (ns, subrule) in rule.rhs.iter().enumerate() {
-            let n = nr + ns;
+        for subrule in rule.rhs.iter() {
             if subrule.inner.is_empty() {
-                rule_nulling_rule_n.push(nr);
+                rule_nulling_cond_n.push(i_n);
+                rule_nulling_rule_id.push(i_n);
                 rule_nulling_action.push(subrule.action.block.clone().unwrap());
-                rule_nulling_action_c.push(repr_variant(nr as u32));
+                rule_nulling_action_c.push(repr_variant((nr + offset_rules) as u32));
             } else {
-                rule_cond_n.push(rule_nulling_offset);
-                rule_nulling_offset += 1;
-                let (tup_nth, tup_pat): (Vec<usize>, Vec<P<Pat>>) =
-                subrule.inner.iter().enumerate().filter_map(|(nth, expr)| {
-                    match expr {
-                        &Tagged(ref t) => {
-                            let variant_name = repr_variant(namespace[t.name.ident.name].1);
-                            let pat = t.pat.clone();
-                            let pat = quote_pat!(cx, Repr::$variant_name($pat));
-                            Some((nth, pat))
-                        }
-                        &Untagged(ref t) =>
-                            None,
-                        _ => unreachable!()
-                    }
-                }).unzip();
-                rule_tup_nth.push(tup_nth);
-                rule_tup_pat.push(tup_pat);
+                rule_cond_n.push(i_n);
                 rule_action.push(subrule.action.block.clone().unwrap());
-                rule_action_c.push(repr_variant(nr as u32));
+                rule_action_c.push(repr_variant((nr + offset_rules) as u32));
+
+                let &Alternative {
+                    ref inner,
+                    ref pats,
+                    ..
+                } = subrule;
+
+                let (mut tup_nth, mut tup_variant, mut tup_pat) = (vec![], vec![], vec![]);
+                for &(nth, ref pat) in pats.iter() {
+                    let variant_name = match &inner[nth] { &NameExpr(name) => name, _ => unreachable!() };
+                    let variant_name = repr_variant(namespace[variant_name].1);
+                    tup_nth.push(nth);
+                    tup_variant.push(variant_name);
+                    tup_pat.push(pat.clone());
+                }
+                rule_tup_nth.push(tup_nth);
+                rule_tup_variant.push(tup_variant);
+                rule_tup_pat.push(tup_pat);
             }
+            i_n += 1;
         }
     }
 
-    let num_nulling_syms = rule_nulling_rule_n.len();
-    rule_nulling_cond_n.extend(rule_nulling_offset .. rule_nulling_offset + num_nulling_syms);
+    let num_nulling_syms = rule_nulling_rule_id.len();
 
     let (lexer, lexer_opt) = ast.options.iter().map(|o| (o.ident, o.tokens.clone()))
                                                .next()
                                                .unwrap_or_else(|| (token::str_to_ident("regex_scanner"), vec![]));
+
+    let start_variant = repr_variant(offset_rules as u32);
 
     let Token = gensym_ident("Token_");
 
@@ -944,8 +890,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
         struct Grammar<F, G, L> {
             grammar: ::marpa::Grammar,
             scan_syms: [::marpa::Symbol; $num_scan_syms],
-            nulling_syms: [::marpa::Symbol; $num_nulling_syms],
-            rule_ids: [::marpa::Rule; $num_all_rules],
+            nulling_syms: [(::marpa::Symbol, u32); $num_nulling_syms],
+            rule_ids: [::marpa::Rule; $num_rule_ids],
             lexer: L,
             lex_closure: F,
             eval_closure: G,
@@ -972,20 +918,14 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 for s in syms.iter_mut() {
                     *s = grammar.symbol_new().unwrap();
                 }
-                grammar.start_symbol_set(syms[0]);
+                grammar.start_symbol_set(syms[$offset_rules]);
 
                 let mut scan_syms: [Symbol; $num_scan_syms] = unsafe { ::std::mem::uninitialized() };
-                for (dst, src) in scan_syms.iter_mut().zip(syms.iter().skip($num_rules_offset)) {
+                for (dst, src) in scan_syms.iter_mut().zip(syms[..$num_scan_syms].iter()) {
                     *dst = *src;
                 }
 
-                let mut nulling_syms: [Symbol; $num_nulling_syms] = unsafe { ::std::mem::uninitialized() };
-                let nulling_rule_n: &[usize] = &[$($rule_nulling_rule_n,)*];
-                for (dst, &n) in nulling_syms.iter_mut().zip(nulling_rule_n.iter()) {
-                    *dst = syms[n];
-                }
-
-                let rules: [(Symbol, &[Symbol]); $num_rules] = [ $(
+                let rules: [(Symbol, &[Symbol]); $num_rule_alts] = [ $(
                     (syms[$rule_names],
                      &[ $(
                         syms[$rules],
@@ -998,18 +938,22 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                      syms[$seq_rule_separators])
                 )* ];
 
-                let mut rule_ids: [Rule; $num_all_rules] = unsafe { ::std::mem::uninitialized() };
+                let mut rule_ids: [Rule; $num_rule_ids] = unsafe { ::std::mem::uninitialized() };
                 
                 {
-                    let mut iter_dst = rule_ids.iter_mut();
-
-                    for (dst, &(lhs, rhs)) in iter_dst.by_ref().zip(rules.iter()) {
+                    for (dst, &(lhs, rhs)) in rule_ids.iter_mut().zip(rules.iter()) {
                         *dst = grammar.rule_new(lhs, rhs).unwrap() ;
                     }
-                    for (dst, &(lhs, rhs, sep)) in iter_dst.by_ref().zip(seq_rules.iter()) {
+                    for (dst, &(lhs, rhs, sep)) in rule_ids.iter_mut().skip($num_rule_alts).zip(seq_rules.iter()) {
                         *dst = grammar.sequence_new(lhs, rhs, sep).unwrap();
                     }
                 };
+
+                let mut nulling_syms: [(Symbol, u32); $num_nulling_syms] = unsafe { ::std::mem::uninitialized() };
+                let nulling_rule_id_n: &[usize] = &[$($rule_nulling_rule_id,)*];
+                for (dst, &n) in nulling_syms.iter_mut().zip(nulling_rule_id_n.iter()) {
+                    *dst = (rules[n].0, n as u32);
+                }
 
                 grammar.precompute().unwrap();
 
@@ -1043,7 +987,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                         recce.terminals_expected(&mut syms[..])
                     };
                     let terminals_expected = &mut terminals_expected[..terminal_ids_expected.len()];
-                    for (&id, terminal) in terminal_ids_expected.iter().zip(terminals_expected.iter_mut()) {
+                    for (terminal, &id) in terminals_expected.iter_mut().zip(terminal_ids_expected.iter()) {
                         // TODO optimize find
                         *terminal = self.scan_syms.iter().position(|&sym| sym == id).unwrap() as u32;
                     }
@@ -1053,7 +997,6 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                         None => break
                     };
 
-                    // println!("#{}", iter.len());
                     for token in iter {
                         // let expected: Vec<&str> = terminals_expected.iter().map(|&i| l0_names[i as usize]).collect();
                         recce.alternative(self.scan_syms[token.sym()], positions.len() as i32 + 1, 1);
@@ -1128,8 +1071,8 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                         }
                         Step::StepNullingSymbol => {
                             let sym = valuator.symbol();
-                            let choice = self.parent.nulling_syms.iter().position(|s| *s == sym);
-                            let elem = self.parent.eval_closure.call_mut((&mut [], choice.expect("unknown nulling sym")));
+                            let choice = self.parent.nulling_syms.iter().find(|&&(s, _)| s == sym).expect("unknown nulling sym").1;
+                            let elem = self.parent.eval_closure.call_mut((&mut [], choice as usize));
                             self.stack_put(valuator.result() as usize, elem);
                         }
                         Step::StepInactive => {
@@ -1142,7 +1085,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 let result = self.stack.drain().next();
 
                 match result {
-                    Some(Repr::Spec0(val)) =>
+                    Some(Repr::$start_variant(val)) =>
                         Some(val),
                     _ =>
                         None,
@@ -1167,13 +1110,13 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                     $((true, $lex_tup_pat) if choice_ == $lex_cond_n => Some(Repr::$lex_action_c($lex_action)),)*
                     _ => None
                 };
-                r.unwrap()
+                r.expect("marpa-macros: internal error: lexing")
             },
             |args, choice_| {
                 let r = $(
                     if choice_ == $rule_cond_n {
                         match ( true, $( mem::replace(&mut args[$rule_tup_nth], Repr::Continue), )* ) {
-                            ( true, $( $rule_tup_pat, )* ) => Some(Repr::$rule_action_c($rule_action)),
+                            ( true, $( Repr::$rule_tup_variant($rule_tup_pat), )* ) => Some(Repr::$rule_action_c($rule_action)),
                             _ => None
                         }
                     } else
@@ -1204,7 +1147,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                 )* {
                     None
                 };
-                r.unwrap()
+                r.expect("marpa-macros: internal error: eval")
             },
         )
     });

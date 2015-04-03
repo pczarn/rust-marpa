@@ -1,1038 +1,2268 @@
 #![crate_name = "marpa_macros"]
-
-#![feature(plugin_registrar, quote, globs, macro_rules, box_syntax, rustc_private, box_patterns)]
+#![feature(plugin, plugin_registrar, unboxed_closures, quote, globs, macro_rules, box_syntax, rustc_private, box_patterns, trace_macros)]
 
 extern crate rustc;
 extern crate syntax;
+extern crate marpa;
 #[macro_use] extern crate log;
 
-use self::RuleRhs::*;
-use self::KleeneOp::*;
-use self::InlineActionType::*;
+use self::Expr::*;
+pub use self::RustToken::Tok;
 
 use syntax::ast;
 use syntax::ast::TokenTree;
-use syntax::codemap::respan;
+use syntax::codemap::{respan, DUMMY_SP};
 use syntax::codemap::Span;
 use syntax::ext::base::{ExtCtxt, MacResult, MacEager};
-use syntax::parse::token;
+pub use syntax::parse::token;
 use syntax::parse::parser::Parser;
 use syntax::parse;
-use syntax::util::interner::{StrInterner, RcStr};
+use syntax::util::interner::StrInterner;
 use syntax::ptr::P;
 use syntax::ext::build::AstBuilder;
 use syntax::print::pprust;
 use syntax::parse::common::seq_sep_none;
+use syntax::parse::lexer;
+use syntax::ext::tt::transcribe;
+pub use syntax::parse::token::*;
+use syntax::owned_slice::OwnedSlice;
+
+use syntax::ast::{Ty_, Ty, PathParameters, AngleBracketedParameters, AngleBracketedParameterData, TyPath,
+    PathSegment, Block, TtToken, Pat, Ident, TyTup, TyInfer};
+// use syntax::parse::token::{OpenDelim, CloseDelim};
 
 use std::collections::HashMap;
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::HashSet;
 use std::mem;
 use std::fmt;
+use std::iter;
+use std::iter::AdditiveIterator;
+use std::iter::Iterator;
+use std::iter::IteratorExt;
 
 #[plugin_registrar]
 pub fn plugin_registrar(reg: &mut ::rustc::plugin::Registry) {
     reg.register_macro("grammar", expand_grammar);
 }
 
-macro_rules! rule {
-    ($lhs:ident ::= $rhs:expr) => (
-        Rule {
-            name: $lhs,
-            rhs: $rhs,
-        }
-    )
-}
+// Structures
 
-#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
-enum InlineActionType {
-    InferT,
-    StrSlice,
-    Continue,
-    DirectStr,
-    Explicit(u32),
-    InferFromRule,
-}
-
-#[derive(Clone)]
-struct InlineAction {
-    block: P<ast::Block>,
-    ty_return: InlineActionType,
-}
-
-#[derive(Clone, Debug)]
-struct InlineBind {
-    pat: P<ast::Pat>,
-    ty_param: InlineActionType,
-}
-
-impl InlineAction {
-    fn new(block: P<ast::Block>) -> InlineAction {
-        InlineAction {
-            block: block,
-            ty_return: InferT
-        }
-    }
-}
-
-impl InlineBind {
-    fn new(pat: P<ast::Pat>) -> InlineBind {
-        InlineBind {
-            pat: pat,
-            ty_param: InferT
-        }
-    }
-}
-
-#[derive(Copy, Clone, Debug)]
-pub enum KleeneOp {
-    ZeroOrMore,
-    OneOrMore,
-}
-
-#[derive(Clone, Debug)]
-struct LexemeRhs {
-    tts: Vec<TokenTree>,
-    bind: Option<InlineBind>,
-    action: Option<InlineAction>,
-}
-
-#[derive(Clone, Debug)]
-enum RuleRhs {
-    Alternative(Vec<RuleRhs>),
-    Sequence(Vec<RuleRhs>, Option<InlineAction>),
-    Ident(ast::Name, Option<InlineBind>),
-    Repeat(Box<RuleRhs>, KleeneOp),
-    Lexeme(LexemeRhs),
+#[derive(Debug)]
+struct Context {
+    options: Vec<Opt>,
+    rules: Vec<Rule>,
+    l0_rules: Vec<L0Rule>,
 }
 
 #[derive(Debug)]
 struct Rule {
     name: ast::Name,
-    rhs: RuleRhs,
+    ty: P<Ty>,
+    rhs: Vec<Alternative>,
 }
 
-impl InlineActionType {
-    fn pat_match(&self, cx: &mut Context, pat: P<ast::Pat>) -> P<ast::Pat> {
-        match *self {
-            InferT =>
-                quote_pat!(cx.ext, SlifRepr::ValInfer($pat)),
-            StrSlice =>
-                quote_pat!(cx.ext, SlifRepr::ValLexed($pat)),
-            DirectStr =>
-                pat,
-            Explicit(n) => {
-                let n_s = format!("Spec{}", n);
-                let ident = token::str_to_ident(n_s.as_slice());
-                quote_pat!(cx.ext, SlifRepr::$ident($pat))
-            }
-            Continue | InferFromRule =>
-                unreachable!(),
-        }
-    }
+#[derive(Debug)]
+struct L0Rule {
+    name: ast::Name,
+    ty: P<Ty>,
+    pat: Option<P<Pat>>,
+    rhs: Vec<Token>,
+    action: InlineAction,
 }
 
-impl InlineAction {
-    fn expr_wrap(self, cx: &mut Context) -> P<ast::Expr> {
-        let InlineAction { ty_return, block } = self;
-        match ty_return {
-            InferT =>
-                quote_expr!(cx.ext, SlifRepr::ValInfer($block)),
-            StrSlice =>
-                quote_expr!(cx.ext, SlifRepr::ValLexed($block)),
-            Continue =>
-                quote_expr!(cx.ext, SlifRepr::Continue),
-            Explicit(n) => {
-                let n_s = format!("Spec{}", n);
-                let ident = token::str_to_ident(n_s.as_slice());
-                quote_expr!(cx.ext, SlifRepr::$ident($block))
-            }
-            DirectStr | InferFromRule =>
-                unreachable!(),
-        }
-    }
+#[derive(Debug)]
+struct Alternative {
+    inner: Vec<Expr>,
+    pats: Vec<(usize, P<Pat>)>,
+    action: InlineAction,
 }
 
-impl InlineBind {
-    fn pat_match(self, cx: &mut Context, nth: usize)
-                -> (P<ast::Pat>, Option<(P<ast::Expr>, P<ast::Pat>)>) {
-        let InlineBind { ty_param, pat } = self;
-
-        let by_val_ident = match pat.node {
-            ast::PatIdent(ast::BindByValue(..), ident, _) if ty_param != DirectStr =>
-                Some(ident),
-            _ =>
-                None
-        };
-
-        let mut b_pat = ty_param.pat_match(cx, pat);
-
-        let mut r_stmt = None;
-
-        if let Some(ident) = by_val_ident {
-            r_stmt = Some((
-                quote_expr!(cx.ext,
-                    mem::replace(&mut args[$nth], SlifRepr::Continue)
-                ),
-                b_pat.clone()));
-            b_pat = cx.ext.pat_wild(cx.sp);
-        }
-
-        (b_pat, r_stmt)
-    }
+#[derive(Debug)]
+enum Expr {
+    NameExpr(ast::Name),
+    ExprOptional(Box<Expr>),
+    ExprSeq(Vec<Expr>, Vec<Expr>, ast::KleeneOp),
 }
 
-impl RuleRhs {
-    fn extract_sub_rules(&mut self, cx: &mut Context, cont: &mut Vec<Rule>, top: bool) {
-        match self {
-            &mut Lexeme(..) if !top => {
-                // displace the lexical rule
-                let new_sym = cx.syms.gensym("");
-                let ty_pass = StrSlice;
-                cx.val_reprs.insert(ty_pass);
-                let new_bind;
+#[derive(Debug)]
+struct InlineAction {
+    block: Option<P<Block>>,
+}
 
-                match self {
-                    &mut Lexeme(ref mut lex) => {
-                        lex.action = Some(InlineAction {
-                            block: cx.ext.block_expr(quote_expr!(cx.ext, arg_)),
-                            ty_return: ty_pass,
-                        });
-                        new_bind = lex.bind.take().map(|b| InlineBind { pat: b.pat, ty_param: ty_pass });
-                    }
-                    _ => unreachable!()
-                }
+#[derive(Debug)]
+struct Opt {
+    ident: ast::Ident,
+    tokens: Vec<TokenTree>,
+}
 
-                let this = Ident(new_sym, new_bind);
-                let displaced_lex = mem::replace(self, this);
+struct SeqRule {
+    name: ast::Name,
+    ty: P<Ty>,
+    rhs: ast::Name,
+    sep: ast::Name,
+}
 
-                cont.push(rule!(new_sym ::= displaced_lex));
-            }
-            &mut Repeat(box ref mut sub_rule, _) => match sub_rule {
-                &mut Ident(..) => {},
-                other_sub_rule => {
-                    other_sub_rule.extract_sub_rules(cx, cont, false);
-                    let new_sym = cx.syms.gensym("");
-                    let other = mem::replace(other_sub_rule, Ident(new_sym, None)); // None??
-                    cont.push(rule!(new_sym ::= other));
-                }
-            },
-            &mut Sequence(ref mut seq, _) | &mut Alternative(ref mut seq) => {
-                for rule in seq.iter_mut() {
-                    rule.extract_sub_rules(cx, cont, false);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn create_seq_rules(&mut self, syms: &mut StrInterner, cont: &mut Vec<Rule>) {
-        match self {
-            &mut Sequence(ref mut seq, _) | &mut Alternative(ref mut seq) => {
-                for rule in seq.iter_mut() {
-                    rule.create_seq_rules(syms, cont);
-                }
-            }
-            &mut Repeat(box ref mut repeated, op) => {
-                let new_sym = syms.gensym("");
-                let repeated = mem::replace(repeated, Ident(new_sym, None));
-                match op {
-                    ZeroOrMore => {
-                        cont.push(rule!(new_sym ::= Sequence(vec![], None)));
-                    }
-                    OneOrMore => {
-                        cont.push(rule!(new_sym ::= repeated.clone()));
-                    }
-                }
-                cont.push(rule!(
-                    new_sym ::= Sequence(vec![Ident(new_sym, None), repeated], None)
-                ));
-            }
-            &mut Ident(..) | &mut Lexeme(..) => {}
-        }
-    }
-
-    fn alternative(self, new: RuleRhs) -> RuleRhs {
-        // flattened alternative
-        match self {
-            Alternative(mut alt_seq) => {
-                alt_seq.push(new);
-                Alternative(alt_seq)
-            }
-            other => Alternative(vec![new, other]),
-        }
-    }
+struct ExtractionContext<'a, 'b: 'a> {
+    namespace: &'a mut HashMap<ast::Name, (u32, u32)>,
+    l0_types: Vec<P<Ty>>,
+    types: Vec<P<Ty>>,
+    sp: Span,
+    ext: &'a mut ExtCtxt<'b>,
 }
 
 impl Rule {
-    fn ident(left: ast::Name, right: ast::Name) -> Rule {
-        Rule { name: left, rhs: Ident(right, None) }
-    }
+    fn extract(&mut self, cx: &mut ExtractionContext) -> (Vec<Rule>, Vec<SeqRule>) {
+        let mut new_rules = vec![];
+        let mut new_seq_rules = vec![];
 
-    fn extract_sub_rules(&mut self, cx: &mut Context, cont: &mut Vec<Rule>) {
-        self.rhs.extract_sub_rules(cx, cont, true);
-    }
+        for alt in &mut self.rhs {
+            for expr in &mut alt.inner {
+                let (_, r, s) = expr.extract(cx);
 
-    fn create_seq_rules(&mut self, syms: &mut StrInterner, cont: &mut Vec<Rule>) {
-        self.rhs.create_seq_rules(syms, cont);
-    }
-
-    fn join_action_ty(&self, tys: &mut HashMap<ast::Name, Option<InlineActionType>>) {
-        let ty_return = match self.rhs {
-            Sequence(_, ref action) => {
-                action.as_ref().map(|a| a.ty_return)
+                new_rules.extend(r.into_iter());
+                new_seq_rules.extend(s.into_iter());
             }
-            Lexeme(LexemeRhs { ref action, .. }) => {
-                Some(action.as_ref().map(|a| a.ty_return).unwrap_or(StrSlice))
-            }
-            _ => { return; }
-        };
-
-        let elem = tys.entry(self.name).get().unwrap_or_else(|ve| ve.insert(ty_return));
-
-        if *elem == Some(InferFromRule) {
-            *elem = ty_return;
-        } else if *elem != ty_return && ty_return != Some(InferFromRule) {
-            panic!("cannot infer: expected {:?}, found {:?}", elem, ty_return);
         }
+
+        (new_rules, new_seq_rules)
     }
+}
 
-    fn infer_action_ty(&mut self, tys: &HashMap<ast::Name, Option<InlineActionType>>) {
-        match self.rhs {
-            Sequence(ref mut inner, Some(InlineAction { ref mut ty_return, .. })) => {
-                if let Some(&Some(val)) = tys.get(&self.name) {
-                    *ty_return = val;
-                }
+impl Expr {
+    // Transforms an expr into NameExpr
+    fn extract(&mut self, cx: &mut ExtractionContext) -> (P<Ty>, Vec<Rule>, Vec<SeqRule>) {
+        let mut replace_with = None;
+        let mut v_rules = vec![];
+        let mut v_seq_rules = vec![];
 
-                for rhs in inner.iter_mut() {
-                    if let &mut Ident(bind_name, Some(InlineBind { ref mut ty_param, .. })) = rhs {
-                        if let Some(&Some(val)) = tys.get(&bind_name) {
-                            *ty_param = val;
+        let tup = match self {
+            &mut NameExpr(name) => {
+                let (kind, n) = cx.namespace[name];
+                let n = n as usize;
+                let ty = if kind == 1 { cx.types[n].clone() } else { cx.l0_types[n].clone() };
+                (ty, vec![], vec![])
+            }
+            &mut ExprOptional(ref mut inner) => {
+                let (inner_ty, new_r, new_seq) = inner.extract(cx);
+                v_rules.extend(new_r.into_iter());
+                v_seq_rules.extend(new_seq.into_iter());
+                let pat_ident = gensym_ident("_pat_");
+                let pat = cx.ext.pat_ident(cx.sp, pat_ident);
+                let name = gensym_ident("_name_");
+                let ty = quote_ty!(cx.ext, Option<$inner_ty>);
+
+                v_rules.push(Rule {
+                    name: name.name,
+                    ty: ty.clone(),
+                    rhs: vec![
+                        Alternative {
+                            inner: vec![NameExpr(inner.name())],
+                            pats: vec![(0, pat)],
+                            action: InlineAction {
+                                block: Some(cx.ext.block_expr(cx.ext.expr_some(cx.sp, cx.ext.expr_ident(cx.sp, pat_ident)))),
+                            }
+                        },
+                        Alternative {
+                            inner: vec![],
+                            pats: vec![],
+                            action: InlineAction {
+                                block: Some(cx.ext.block_expr(cx.ext.expr_none(cx.sp))),
+                            }
                         }
-                    }
-                }
+                    ],
+                });
+
+                replace_with = Some(NameExpr(name.name));
+
+                (ty, v_rules, v_seq_rules)
             }
-            Ident(bind_name, Some(InlineBind { ref mut ty_param, .. })) => {
-                if let Some(&Some(val)) = tys.get(&bind_name) {
-                    *ty_param = val;
+            &mut ExprSeq(ref mut body, ref mut sep, _op) => {
+                let mut v_body_ty = vec![];
+
+                for e in body.iter_mut() {
+                    let (ty, a, b) = e.extract(cx);
+                    v_body_ty.push(ty);
+                    v_rules.extend(a.into_iter());
+                    v_seq_rules.extend(b.into_iter());
                 }
-            }
-            _ => {}
-        }
-    }
 
-    fn alternatives(self) -> Vec<Rule> {
-        match self {
-            Rule { rhs: Alternative(alt_seq), name } =>
-                alt_seq.into_iter().map(|alt| Rule { name: name, rhs: alt }).collect(),
-            Rule { rhs, name } =>
-                vec![rhs].into_iter().map(|alt| Rule { name: name, rhs: alt }).collect(),
-        }
-    }
-}
+                let name = gensym_ident("_name_");
+                let name_body = gensym_ident("_name_body_");
+                let name_sep = gensym_ident("_name_sep_");
 
-struct Context<'a, 'b: 'a> {
-    ext: &'a mut ExtCtxt<'b>,
-    sp: Span,
-    parser: Parser<'a>,
-    val_reprs: HashSet<InlineActionType>,
-    explicit_tys: HashMap<P<ast::Ty>, u32>,
-    syms: StrInterner,
-    lexer: Option<(ast::Ident, Vec<TokenTree>)>,
-}
+                let mut v_body = mem::replace(body, vec![]);
+                let mut v_pats = vec![];
 
-impl<'a, 'b: 'a> Context<'a, 'b> {
-    fn parse_bound(&mut self) -> Option<P<ast::Pat>> {
-        if self.parser.token.is_ident() &&
-                !self.parser.token.is_strict_keyword() &&
-                !self.parser.token.is_reserved_keyword() &&
-                self.parser.look_ahead(1, |t| *t == token::Colon) ||
-                self.parser.token == token::OpenDelim(token::Paren) {
-            let parenthesized = self.parser.eat(&token::OpenDelim(token::Paren));
-            let bound_with = self.parser.parse_pat();
-            if parenthesized {
-                self.parser.expect(&token::CloseDelim(token::Paren));
-            }
-            self.parser.expect(&token::Colon);
-            Some(bound_with)
-        } else {
-            None
-        }
-    }
-
-    fn parse_name_or_repeat(&mut self) -> RuleRhs {
-        let mut seq = vec![];
-        loop {
-            let bound_with = self.parse_bound();
-            let elem = if self.parser.token.is_ident() &&
-                    !self.parser.token.is_strict_keyword() &&
-                    !self.parser.token.is_reserved_keyword() {
-                let ident = self.parser.parse_ident();
-                let new_name = self.syms.intern(ident.as_str());
-                // Give a better type?
-                Ident(new_name, bound_with.map(|b| InlineBind::new(b)))
-            } else {
-                match self.parser.token {
-                    token::Literal(token::Str_(_), _) | token::Literal(token::StrRaw(..), _) => {
-                        Lexeme(LexemeRhs {
-                            tts: vec![self.parser.parse_token_tree()],
-                            bind: bound_with.map(|b| InlineBind { pat: b, ty_param: DirectStr }),
-                            action: None,
-                        })
-                    }
-                    _ => break
-                }
-                // match self.parser.parse_optional_str() {
-                //     Some((s, _, suf)) => {
-                //         let sp = self.parser.last_span;
-                //         self.parser.expect_no_suffix(sp, "str literal", suf);
-                //         Lexeme(LexemeRhs {
-                //             // regstr: s,
-                //             tts: 
-                //             bind: bound_with.map(|b| InlineBind { pat: b, ty_param: DirectStr }),
-                //             action: None,
-                //         })
-                //     }
-                //     _ => break
-                // }
-            };
-            let elem_or_rep = match self.parser.token {
-                token::BinOp(token::Star) => {
-                    self.parser.bump();
-                    Repeat(box elem, ZeroOrMore)
-                }
-                token::BinOp(token::Plus) => {
-                    self.parser.bump();
-                    Repeat(box elem, OneOrMore)
-                }
-                _ => elem,
-            };
-            seq.push(elem_or_rep);
-        }
-
-        let blk = if self.parser.token == token::OpenDelim(token::Brace) ||
-                     self.parser.token == token::RArrow {
-            let output_ty = if self.parser.eat(&token::RArrow) {
-                let ty = self.parser.parse_ty();
-
-                if let ast::TyInfer = ty.node {
-                    // -> _ {}
-                    InferFromRule
+                let (action, inner_ty) = if v_body.len() == 1 {
+                    let pat_ident = gensym_ident("_pat_ident_");
+                    v_pats.push((0, cx.ext.pat_ident(cx.sp, pat_ident)));
+                    (InlineAction { block: Some(cx.ext.block_expr(cx.ext.expr_ident(cx.sp, pat_ident))) },
+                     v_body_ty.pop().unwrap())
                 } else {
-                    // -> Foo {}
-                    let len = self.explicit_tys.len() as u32;
-                    let n_ty = self.explicit_tys.entry(ty).get().unwrap_or_else(|ve| ve.insert(len));
+                    unreachable!()
+                };
 
-                    Explicit(*n_ty)
-                }
-            } else {
-                self.val_reprs.insert(InferT);
-                // {}
-                InferT
-            };
+                v_rules.push(Rule {
+                    name: name_body.name,
+                    ty: inner_ty.clone(),
+                    rhs: vec![
+                        Alternative {
+                            inner: v_body,
+                            pats: v_pats,
+                            action: action,
+                        }
+                    ],
+                });
 
-            let block = self.parser.parse_block();
-            Some(InlineAction { ty_return: output_ty, block: block })
-        } else {
-            None
+                v_rules.push(Rule {
+                    name: name_sep.name,
+                    ty: quote_ty!(cx.ext, ()),
+                    rhs: vec![
+                        Alternative {
+                            inner: mem::replace(sep, vec![]),
+                            pats: vec![],
+                            action: InlineAction { block: Some(cx.ext.block_expr(cx.ext.expr_tuple(cx.sp, vec![]))) },
+                        }
+                    ],
+                });
+
+                let ty = quote_ty!(cx.ext, Vec<$inner_ty>);
+
+                v_seq_rules.push(SeqRule {
+                    name: name.name,
+                    ty: ty.clone(),
+                    rhs: name_body.name,
+                    sep: name_sep.name,
+                });
+
+                replace_with = Some(NameExpr(name.name));
+
+                (ty, v_rules, v_seq_rules)
+            }
         };
 
-        return Sequence(seq, blk);
+        if let Some(with) = replace_with {
+            *self = with;
+        }
+
+        tup
     }
 
-    fn parse_rhs(&mut self) -> RuleRhs {
-        let elem = self.parse_name_or_repeat();
-        if self.parser.eat(&token::BinOp(token::Or)) {
-            // flattened alternative
-            self.parse_rhs().alternative(elem)
-        } else {
-            // complete this rule
-            self.parser.expect_one_of(&[token::Semi], &[token::Eof]);
-            elem
+    fn name(&self) -> ast::Name {
+        match self {
+            &NameExpr(name) => name,
+            _ => unreachable!()
         }
     }
+}
 
-    fn parse_rule(&mut self) -> Option<Rule> {
-        let ident = self.parser.parse_ident();
+fn repr_variant(n: u32) -> Ident {
+    let variant_name = format!("Spec{}", n);
+    token::str_to_ident(&variant_name[..])
+}
 
-        if self.parser.eat(&token::Not) {
-            let tts = match self.parser.token {
-                token::OpenDelim(delim) => {
-                    self.parser.bump();
+fn quote_block(cx: &mut ExtCtxt, toks: Vec<Token>) -> P<Block> {
+    let tts: Vec<TokenTree> = toks.into_iter().map(|t| TtToken(DUMMY_SP, t)).collect();
+    cx.block_expr(quote_expr!(cx, { $tts }))
+}
 
-                    // Parse the token trees within the delimiters
-                    let tts = self.parser.parse_seq_to_before_end(
-                        &token::CloseDelim(delim),
-                        seq_sep_none(),
-                        |p| p.parse_token_tree()
-                    );
+fn quote_pat(cx: &mut ExtCtxt, toks: Vec<Token>) -> P<Pat> {
+    let tts: Vec<TokenTree> = toks.into_iter().map(|t| TtToken(DUMMY_SP, t)).collect();
+    quote_pat!(cx, $tts)
+}
 
-                    self.parser.bump();
+fn quote_tokens(cx: &mut ExtCtxt, toks: Vec<Token>) -> Vec<TokenTree> {
+    toks.into_iter().map(|t| TtToken(DUMMY_SP, t)).collect()
+}
 
-                    // if tts.is_empty() {
-                    //     None
-                    // } else {
-                    //     Some(tts)
-                    // }
-                    tts
+fn panic(arg: &RustToken) -> ! {
+    panic!("{:?}", arg);
+}
+
+#[derive(Debug)]
+pub enum RustToken {
+    Delim(Token),
+    Tok(Token)
+}
+
+fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, (u32, u32)>, Option<L0Rule>) {
+    type Alt = (Vec<Expr>, Vec<(usize, P<Pat>)>);
+
+    let mut grammar = {
+    use std::vec::IntoIter;
+    use std::marker::PhantomData;
+    type LInp<'a> = &'a [RustToken];
+    type LOut<'a> = &'a RustToken;
+    #[derive(Debug)]
+    struct Token_ {
+        sym: u32,
+        offset: u32,
+    }
+    struct LPar<'a, 'b> {
+        input: LInp<'a>,
+        offset: usize,
+        marker: PhantomData<&'b ()>,
+    }
+    type Input<'a> = &'a [RustToken];
+    type Output<'a> = &'a RustToken;
+    struct EnumAdaptor;
+    impl Token_ {
+        fn sym(&self) -> usize { self.sym as usize }
+    }
+    trait Lexer {
+        fn new_parse<'a, 'b>(&self, input: Input<'a>)
+        -> LPar<'a, 'b>;
+    }
+    impl Lexer for EnumAdaptor {
+        fn new_parse<'a, 'b>(&self, input: Input<'a>) -> LPar<'a, 'b> {
+            LPar{input: input, offset: 0, marker: PhantomData,}
+        }
+    }
+    impl <'a, 'b> LPar<'a, 'b> {
+        fn longest_parses_iter(&mut self, _accept: &[u32])
+         -> Option<IntoIter<Token_>> {
+            while !self.is_empty() {
+                match (true, &self.input[self.offset]) {
+                    (true, &Tok(Whitespace)) => { self.offset += 1; }
+                    _ => break ,
                 }
-                _ => {
-                    let sp = self.parser.span;
-                    self.parser.span_err(sp, "expected macro-like invocation");
-                    return None;
+            }
+            if self.is_empty() { return None; }
+            let mut syms = vec!();
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Tilde)) => {
+                    syms.push((0u32, self.offset as u32));
                 }
-            };
-            self.lexer = Some((ident, tts));
-            self.parser.expect(&token::Semi);
-            return None;
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(::syntax::parse::token::Ident(..))) => {
+                    syms.push((1u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(::syntax::parse::token::Ident(..))) => {
+                    syms.push((2u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(ModSep)) => {
+                    syms.push((3u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Not)) => {
+                    syms.push((4u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Eq)) => { syms.push((5u32, self.offset as u32)); }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Lt)) => { syms.push((6u32, self.offset as u32)); }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Gt)) => { syms.push((7u32, self.offset as u32)); }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Semi)) => {
+                    syms.push((8u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(RArrow)) => {
+                    syms.push((9u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Colon)) => {
+                    syms.push((10u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(BinOp(Or))) => {
+                    syms.push((11u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Underscore)) => {
+                    syms.push((12u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(Question)) => {
+                    syms.push((13u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(BinOp(Star))) => {
+                    syms.push((14u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &RustToken::Delim(OpenDelim(Brace))) => {
+                    syms.push((15u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &RustToken::Delim(CloseDelim(Brace))) => {
+                    syms.push((16u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &RustToken::Delim(OpenDelim(Paren))) => {
+                    syms.push((17u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &RustToken::Delim(CloseDelim(Paren))) => {
+                    syms.push((18u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &RustToken::Delim(OpenDelim(Bracket))) => {
+                    syms.push((19u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &RustToken::Delim(CloseDelim(Bracket))) => {
+                    syms.push((20u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &Tok(..)) => {
+                    syms.push((21u32, self.offset as u32));
+                }
+                _ => (),
+            }
+            match (true, &self.input[self.offset]) {
+                (true, &_) => { syms.push((22u32, self.offset as u32)); }
+                _ => (),
+            }
+            assert!(! syms . is_empty (  ));
+            self.offset += 1;
+            Some(syms.map_in_place(|(n, offset)|
+                                       Token_{sym: n,
+                                              offset: offset,}).into_iter())
         }
-
-        let new_name = self.syms.intern(ident.as_str());
-
-        if self.parser.eat(&token::Tilde) {
-            // assertion
-            // if let Sequence(seq, blk) = self.parse_rhs() {
-            //     if let Some(Lexeme(LexemeRhs { regstr, bind: bound_with, action: None }))
-            //             = seq.into_iter().next() {
-            //         return Some(Rule {
-            //             name: new_name,
-            //             rhs: Lexeme(LexemeRhs { regstr: regstr, bind: bound_with, action: blk }),
-            //         });
-            //     }
-            //     // next?
-            // }
-            let bind = self.parse_bound().map(|b| InlineBind { pat: b, ty_param: DirectStr });
-            let mut tts = vec![];
-            while self.parser.token != token::Semi
-                    && self.parser.token != token::OpenDelim(token::Brace)
-                    && self.parser.token != token::RArrow {
-                tts.push(self.parser.parse_token_tree());
-            }
-            if let Sequence(seq, blk) = self.parse_rhs() {
-                assert!(seq.is_empty());
-                return Some(Rule {
-                    name: new_name,
-                    rhs: Lexeme(LexemeRhs { tts: tts, bind: bind, action: blk }),
-                });
-            }
-
-            let sp = self.parser.span;
-            self.parser.span_err(sp, "expected a lexical rule");
-            None
-        } else if self.parser.eat(&token::ModSep) && self.parser.eat(&token::Eq) {
-            Some(Rule {
-                name: new_name,
-                rhs: self.parse_rhs(),
-            })
-        } else {
-            let sp = self.parser.span;
-            self.parser.span_err(sp, "expected `::=` or `~`");
-            None
+        fn is_empty(&self) -> bool {
+            debug_assert!(self . offset <= self . input . len (  ));
+            self.offset == self.input.len()
+        }
+        fn get(&self, toks: &[Token_], idx: usize) -> (&'a RustToken, usize) {
+            (&self.input[toks[idx].offset as usize], toks[idx].sym())
         }
     }
+    fn new_lexer() -> EnumAdaptor { EnumAdaptor }
+    {
+        enum Repr<'a> {
+            Continue,
+            Unused(PhantomData<&'a ()>),
+            Spec0(()),
+            Spec1(::syntax::ast::Ident),
+            Spec2(::syntax::parse::token::Token),
+            Spec3(()),
+            Spec4(()),
+            Spec5(()),
+            Spec6(()),
+            Spec7(()),
+            Spec8(()),
+            Spec9(()),
+            Spec10(()),
+            Spec11(()),
+            Spec12(()),
+            Spec13(()),
+            Spec14(()),
+            Spec15(()),
+            Spec16(()),
+            Spec17(()),
+            Spec18(()),
+            Spec19(()),
+            Spec20(()),
+            Spec21(::syntax::parse::token::Token),
+            Spec22(::syntax::parse::token::Token),
+            Spec23(Context),
+            Spec24(Vec<Opt>),
+            Spec25(Opt),
+            Spec26(Vec<Rule>),
+            Spec27(Rule),
+            Spec28(Vec<Alternative>),
+            Spec29(Alternative),
+            Spec30(Alt),
+            Spec31(Vec<Expr>),
+            Spec32(Expr),
+            Spec33(Option<P<Pat>>),
+            Spec34(P<Ty>),
+            Spec35(InlineAction),
+            Spec36(P<Ty>),
+            Spec37(Ty_),
+            Spec38(ast::Path),
+            Spec39(Vec<PathSegment>),
+            Spec40(PathSegment),
+            Spec41(PathParameters),
+            Spec42(Vec<L0Rule>),
+            Spec43(L0Rule),
+            Spec44(P<Block>),
+            Spec45(Vec<Token>),
+            Spec46(Vec<Token>),
+            Spec47(Vec<Token>),
+            Spec48(Vec<Token>),
+            Spec49(Vec<Token>),
+            Spec50(Vec<Token>),
+            Spec51(()),
+        }
+        struct Grammar<F, G, L> {
+            grammar: ::marpa::Grammar,
+            scan_syms: [::marpa::Symbol; 23usize],
+            nulling_syms: [(::marpa::Symbol, u32); 0usize],
+            rule_ids: [::marpa::Rule; 54usize],
+            lexer: L,
+            lex_closure: F,
+            eval_closure: G,
+        }
+        struct Parses<'a, 'b, F: 'b, G: 'b, L: 'b> {
+            tree: ::marpa::Tree,
+            lex_parse: LPar<'a, 'b>,
+            positions: Vec<Token_>,
+            stack: Vec<Repr<'a>>,
+            parent: &'b mut Grammar<F, G, L>,
+        }
+        impl <F, G, L: Lexer> Grammar<F, G, L> where
+         F: for<'c>FnMut(LOut<'c>, usize) -> Repr<'c>,
+         G: for<'c>FnMut(&mut [Repr<'c>], usize) -> Repr<'c> {
+            fn new(lexer: L, lex_closure: F, eval_closure: G)
+             -> Grammar<F, G, L> {
+                use marpa::{Config, Symbol, Rule};
+                let mut cfg = Config::new();
+                let mut grammar =
+                    ::marpa::Grammar::with_config(&mut cfg).unwrap();
+                let mut syms: [Symbol; 52usize] =
+                    unsafe { ::std::mem::uninitialized() };
+                for s in syms.iter_mut() {
+                    *s = grammar.symbol_new().unwrap();
+                }
+                grammar.start_symbol_set(syms[23usize]);
+                let mut scan_syms: [Symbol; 23usize] =
+                    unsafe { ::std::mem::uninitialized() };
+                for (dst, src) in
+                    scan_syms.iter_mut().zip(syms[..23usize].iter()) {
+                    *dst = *src;
+                }
+                let rules: [(Symbol, &[Symbol]); 54usize] =
+                    [(syms[23usize],
+                      &[syms[24usize], syms[26usize], syms[42usize]]),
+                     (syms[24usize], &[syms[24usize], syms[25usize]]),
+                     (syms[24usize], &[syms[25usize]]),
+                     (syms[25usize],
+                      &[syms[1usize], syms[4usize], syms[17usize],
+                        syms[48usize], syms[18usize], syms[8usize]]),
+                     (syms[26usize], &[syms[26usize], syms[27usize]]),
+                     (syms[26usize], &[syms[27usize]]),
+                     (syms[27usize],
+                      &[syms[1usize], syms[34usize], syms[51usize],
+                        syms[28usize], syms[8usize]]),
+                     (syms[28usize], &[syms[29usize]]),
+                     (syms[28usize],
+                      &[syms[28usize], syms[11usize], syms[29usize]]),
+                     (syms[29usize], &[syms[30usize], syms[35usize]]),
+                     (syms[30usize], &[syms[32usize]]),
+                     (syms[30usize], &[syms[33usize], syms[32usize]]),
+                     (syms[30usize], &[syms[30usize], syms[32usize]]),
+                     (syms[30usize],
+                      &[syms[30usize], syms[33usize], syms[32usize]]),
+                     (syms[31usize], &[syms[32usize]]),
+                     (syms[31usize], &[syms[32usize], syms[31usize]]),
+                     (syms[32usize], &[syms[1usize]]),
+                     (syms[32usize], &[syms[32usize], syms[13usize]]),
+                     (syms[32usize],
+                      &[syms[19usize], syms[31usize], syms[20usize],
+                        syms[15usize], syms[31usize], syms[16usize],
+                        syms[14usize]]),
+                     (syms[33usize], &[syms[2usize], syms[10usize]]),
+                     (syms[33usize],
+                      &[syms[17usize], syms[48usize], syms[18usize],
+                        syms[10usize]]),
+                     (syms[34usize], &[syms[9usize], syms[36usize]]),
+                     (syms[35usize], &[syms[44usize]]),
+                     (syms[36usize], &[syms[37usize]]),
+                     (syms[37usize], &[syms[38usize]]),
+                     (syms[37usize], &[syms[17usize], syms[18usize]]),
+                     (syms[37usize], &[syms[12usize]]),
+                     (syms[38usize], &[syms[3usize], syms[39usize]]),
+                     (syms[38usize], &[syms[39usize]]),
+                     (syms[39usize],
+                      &[syms[39usize], syms[3usize], syms[40usize]]),
+                     (syms[39usize], &[syms[40usize]]),
+                     (syms[40usize], &[syms[1usize]]),
+                     (syms[40usize], &[syms[1usize], syms[41usize]]),
+                     (syms[41usize],
+                      &[syms[6usize], syms[36usize], syms[7usize]]),
+                     (syms[42usize], &[syms[42usize], syms[43usize]]),
+                     (syms[42usize], &[syms[43usize]]),
+                     (syms[43usize],
+                      &[syms[1usize], syms[34usize], syms[0usize],
+                        syms[49usize], syms[35usize], syms[8usize]]),
+                     (syms[44usize], &[syms[47usize]]),
+                     (syms[45usize], &[syms[47usize]]),
+                     (syms[45usize], &[syms[46usize]]),
+                     (syms[46usize], &[syms[21usize]]),
+                     (syms[46usize], &[syms[17usize], syms[18usize]]),
+                     (syms[46usize],
+                      &[syms[17usize], syms[48usize], syms[18usize]]),
+                     (syms[46usize], &[syms[19usize], syms[20usize]]),
+                     (syms[46usize],
+                      &[syms[19usize], syms[48usize], syms[20usize]]),
+                     (syms[47usize], &[syms[15usize], syms[16usize]]),
+                     (syms[47usize],
+                      &[syms[15usize], syms[48usize], syms[16usize]]),
+                     (syms[48usize], &[syms[45usize]]),
+                     (syms[48usize], &[syms[48usize], syms[45usize]]),
+                     (syms[49usize], &[syms[46usize]]),
+                     (syms[49usize], &[syms[49usize], syms[46usize]]),
+                     (syms[50usize], &[syms[22usize]]),
+                     (syms[50usize], &[syms[50usize], syms[22usize]]),
+                     (syms[51usize], &[syms[3usize], syms[5usize]])];
+                let seq_rules: [(Symbol, Symbol, Symbol); 0usize] = [];
+                let mut rule_ids: [Rule; 54usize] =
+                    unsafe { ::std::mem::uninitialized() };
+                {
+                    for (dst, &(lhs, rhs)) in
+                        rule_ids.iter_mut().zip(rules.iter()) {
+                        *dst = grammar.rule_new(lhs, rhs).unwrap();
+                    }
+                    for (dst, &(lhs, rhs, sep)) in
+                        rule_ids.iter_mut().skip(54usize).zip(seq_rules.iter())
+                        {
+                        *dst = grammar.sequence_new(lhs, rhs, sep).unwrap();
+                    }
+                };
+                let mut nulling_syms: [(Symbol, u32); 0usize] =
+                    unsafe { ::std::mem::uninitialized() };
+                let nulling_rule_id_n: &[usize] = &[];
+                for (dst, &n) in
+                    nulling_syms.iter_mut().zip(nulling_rule_id_n.iter()) {
+                    *dst = (rules[n].0, n as u32);
+                }
+                grammar.precompute().unwrap();
+                Grammar{lexer: lexer,
+                        lex_closure: lex_closure,
+                        eval_closure: eval_closure,
+                        grammar: grammar,
+                        scan_syms: scan_syms,
+                        nulling_syms: nulling_syms,
+                        rule_ids: rule_ids,}
+            }
+            #[inline]
+            fn parses_iter<'a, 'b>(&'b mut self, input: LInp<'a>)
+             -> Parses<'a, 'b, F, G, L> {
+                use marpa::{Recognizer, Bocage, Order, Tree, Symbol,
+                            ErrorCode};
+                let mut recce = Recognizer::new(&mut self.grammar).unwrap();
+                recce.start_input();
+                let mut lex_parse = self.lexer.new_parse(input);
+                let mut positions = vec!();
+                let mut ith = 0;
+                while !lex_parse.is_empty() {
+                    let mut syms: [Symbol; 23usize] =
+                        unsafe { mem::uninitialized() };
+                    let mut terminals_expected: [u32; 23usize] =
+                        unsafe { mem::uninitialized() };
+                    let terminal_ids_expected =
+                        unsafe { recce.terminals_expected(&mut syms[..]) };
+                    let terminals_expected =
+                        &mut terminals_expected[..terminal_ids_expected.len()];
+                    for (terminal, &id) in
+                        terminals_expected.iter_mut().zip(terminal_ids_expected.iter())
+                        {
+                        *terminal =
+                            self.scan_syms.iter().position(|&sym|
+                                                               sym ==
+                                                                   id).unwrap()
+                                as u32;
+                    }
+                    let mut iter =
+                        match lex_parse.longest_parses_iter(terminals_expected)
+                            {
+                            Some(iter) => iter,
+                            None => break ,
+                        };
+                    for token in iter {
+                        recce.alternative(self.scan_syms[token.sym()],
+                                          positions.len() as i32 + 1, 1);
+                        positions.push(token);
+                    }
+                    recce.earleme_complete();
+                    ith += 1;
+                }
+                let latest_es = recce.latest_earley_set();
+                let mut tree =
+                    Bocage::new(&mut recce,
+                                latest_es).and_then(|mut bocage|
+                                                        Order::new(&mut bocage)).and_then(|mut order|
+                                                                                              Tree::new(&mut order));
+                Parses{tree: tree.unwrap(),
+                       lex_parse: lex_parse,
+                       positions: positions,
+                       stack: vec!(),
+                       parent: self,}
+            }
+        }
+        impl <'a, 'b, F, G, L> Iterator for Parses<'a, 'b, F, G, L> where
+         F: for<'c>FnMut(LOut<'c>, usize) -> Repr<'c>,
+         G: for<'c>FnMut(&mut [Repr<'c>], usize) -> Repr<'c> {
+            type
+            Item
+            =
+            Context;
+            fn next(&mut self) -> Option<Context> {
+                use marpa::{Step, Value};
+                let mut valuator =
+                    if self.tree.next() >= 0 {
+                        Value::new(&mut self.tree).unwrap()
+                    } else { return None; };
+                for &rule in self.parent.rule_ids.iter() {
+                    valuator.rule_is_valued_set(rule, 1);
+                }
+                loop  {
+                    match valuator.step() {
+                        Step::StepToken => {
+                            let idx = valuator.token_value() as usize - 1;
+                            let elem =
+                                self.parent.lex_closure.call_mut(self.lex_parse.get(&self.positions[..],
+                                                                                    idx));
+                            self.stack_put(valuator.result() as usize, elem);
+                        }
+                        Step::StepRule => {
+                            let rule = valuator.rule();
+                            let arg_0 = valuator.arg_0() as usize;
+                            let arg_n = valuator.arg_n() as usize;
+                            let elem =
+                                {
+                                    let slice =
+                                        self.stack.slice_mut(arg_0,
+                                                             arg_n + 1);
+                                    let choice =
+                                        self.parent.rule_ids.iter().position(|r|
+                                                                                 *r
+                                                                                     ==
+                                                                                     rule);
+                                    self.parent.eval_closure.call_mut((slice,
+                                                                       choice.expect("unknown rule")))
+                                };
+                            match elem {
+                                Repr::Continue => { continue  }
+                                other_elem => {
+                                    self.stack_put(arg_0, other_elem);
+                                }
+                            }
+                        }
+                        Step::StepNullingSymbol => {
+                            let sym = valuator.symbol();
+                            let choice =
+                                self.parent.nulling_syms.iter().find(|&&(s,
+                                                                         _)|
+                                                                         s ==
+                                                                             sym).expect("unknown nulling sym").1;
+                            let elem =
+                                self.parent.eval_closure.call_mut((&mut [],
+                                                                   choice as
+                                                                       usize));
+                            self.stack_put(valuator.result() as usize, elem);
+                        }
+                        Step::StepInactive => { break ; }
+                        other => panic!("unexpected step {:?}" , other),
+                    }
+                }
+                let result = self.stack.drain().next();
+                match result {
+                    Some(Repr::Spec23(val)) => Some(val),
+                    _ => None,
+                }
+            }
+        }
+        impl <'a, 'b, F, G, L> Parses<'a, 'b, F, G, L> {
+            fn stack_put(&mut self, idx: usize, elem: Repr<'a>) {
+                if idx == self.stack.len() {
+                    self.stack.push(elem);
+                } else { self.stack[idx] = elem; }
+            }
+        }
+        Grammar::new(new_lexer(), |arg, choice_| {
+                     let r =
+                         match (true, arg) {
+                             (true, _) if choice_ == 0usize =>
+                             Some(Repr::Spec0({ { { } } })),
+                             (true, i) if choice_ == 1usize =>
+                             Some(Repr::Spec1({
+                                                  {
+                                                      {
+                                                          if let &Tok(::syntax::parse::token::Ident(i,
+                                                                                                    _))
+                                                                 = i {
+                                                              i
+                                                          } else {
+                                                              unreachable!();
+                                                          }
+                                                      }
+                                                  }
+                                              })),
+                             (true, i) if choice_ == 2usize =>
+                             Some(Repr::Spec2({
+                                                  {
+                                                      {
+                                                          if let &Tok(ref i) =
+                                                                 i {
+                                                              i.clone()
+                                                          } else {
+                                                              unreachable!()
+                                                          }
+                                                      }
+                                                  }
+                                              })),
+                             (true, _) if choice_ == 3usize =>
+                             Some(Repr::Spec3({ { { } } })),
+                             (true, _) if choice_ == 4usize =>
+                             Some(Repr::Spec4({ { { } } })),
+                             (true, _) if choice_ == 5usize =>
+                             Some(Repr::Spec5({ { { } } })),
+                             (true, _) if choice_ == 6usize =>
+                             Some(Repr::Spec6({ { { } } })),
+                             (true, _) if choice_ == 7usize =>
+                             Some(Repr::Spec7({ { { } } })),
+                             (true, _) if choice_ == 8usize =>
+                             Some(Repr::Spec8({ { { } } })),
+                             (true, _) if choice_ == 9usize =>
+                             Some(Repr::Spec9({ { { } } })),
+                             (true, _) if choice_ == 10usize =>
+                             Some(Repr::Spec10({ { { } } })),
+                             (true, _) if choice_ == 11usize =>
+                             Some(Repr::Spec11({ { { } } })),
+                             (true, _) if choice_ == 12usize =>
+                             Some(Repr::Spec12({ { { } } })),
+                             (true, _) if choice_ == 13usize =>
+                             Some(Repr::Spec13({ { { } } })),
+                             (true, _) if choice_ == 14usize =>
+                             Some(Repr::Spec14({ { { } } })),
+                             (true, _) if choice_ == 15usize =>
+                             Some(Repr::Spec15({ { { } } })),
+                             (true, _) if choice_ == 16usize =>
+                             Some(Repr::Spec16({ { { } } })),
+                             (true, _) if choice_ == 17usize =>
+                             Some(Repr::Spec17({ { { } } })),
+                             (true, _) if choice_ == 18usize =>
+                             Some(Repr::Spec18({ { { } } })),
+                             (true, _) if choice_ == 19usize =>
+                             Some(Repr::Spec19({ { { } } })),
+                             (true, _) if choice_ == 20usize =>
+                             Some(Repr::Spec20({ { { } } })),
+                             (true, tok) if choice_ == 21usize =>
+                             Some(Repr::Spec21({
+                                                   {
+                                                       {
+                                                           if let &Tok(ref tok)
+                                                                  = tok {
+                                                               tok.clone()
+                                                           } else {
+                                                               unreachable!()
+                                                           }
+                                                       }
+                                                   }
+                                               })),
+                             (true, tok) if choice_ == 22usize =>
+                             Some(Repr::Spec22({
+                                                   {
+                                                       {
+                                                           match tok {
+                                                               &RustToken::Delim(ref tok)
+                                                               => tok.clone(),
+                                                               &Tok(ref tok)
+                                                               => tok.clone(),
+                                                           }
+                                                       }
+                                                   }
+                                               })),
+                             _ => None,
+                         }; r.expect("marpa-macros: internal error: lexing")
+                 }, |args, choice_| {
+                     let r =
+                         if choice_ == 0usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[2usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec24(opt), Repr::Spec26(rs),
+                                  Repr::Spec42(rs0)) =>
+                                 Some(Repr::Spec23({
+                                                       {
+                                                           {
+                                                               Context{options:
+                                                                           opt,
+                                                                       rules:
+                                                                           rs,
+                                                                       l0_rules:
+                                                                           rs0,}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 1usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec24(mut opts),
+                                  Repr::Spec25(o)) =>
+                                 Some(Repr::Spec24({
+                                                       {
+                                                           {
+                                                               opts.push(o);
+                                                               opts
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 2usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec25(o)) =>
+                                 Some(Repr::Spec24({
+                                                       {
+                                                           {
+                                                               let mut opts =
+                                                                   Vec::new();
+                                                               opts.push(o);
+                                                               opts
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 3usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[3usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec1(i), Repr::Spec48(tts)) =>
+                                 Some(Repr::Spec25({
+                                                       {
+                                                           {
+                                                               Opt{ident: i,
+                                                                   tokens:
+                                                                       quote_tokens(cx,
+                                                                                    tts),}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 4usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec26(mut rs), Repr::Spec27(r))
+                                 =>
+                                 Some(Repr::Spec26({
+                                                       { { rs.push(r); rs } }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 5usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec27(r)) =>
+                                 Some(Repr::Spec26({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(r);
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 6usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[3usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec1(i), Repr::Spec34(ty),
+                                  Repr::Spec28(rhs)) =>
+                                 Some(Repr::Spec27({
+                                                       {
+                                                           {
+                                                               Rule{name:
+                                                                        i.name,
+                                                                    ty: ty,
+                                                                    rhs: rhs,}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 7usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec29(seq)) =>
+                                 Some(Repr::Spec28({
+                                                       {
+                                                           {
+                                                               let mut rhs =
+                                                                   Vec::new();
+                                                               rhs.push(seq);
+                                                               rhs
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 8usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[2usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec28(mut rhs),
+                                  Repr::Spec29(seq)) =>
+                                 Some(Repr::Spec28({
+                                                       {
+                                                           {
+                                                               rhs.push(seq);
+                                                               rhs
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 9usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec30(v), Repr::Spec35(b)) =>
+                                 Some(Repr::Spec29({
+                                                       {
+                                                           {
+                                                               Alternative{inner:
+                                                                               v.0,
+                                                                           pats:
+                                                                               v.1,
+                                                                           action:
+                                                                               b,}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 10usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec32(a)) =>
+                                 Some(Repr::Spec30({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(a);
+                                                               (v, Vec::new())
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 11usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec33(pat), Repr::Spec32(a)) =>
+                                 Some(Repr::Spec30({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(a);
+                                                               let mut v2 =
+                                                                   Vec::new();
+                                                               v2.push((0,
+                                                                        pat.unwrap()));
+                                                               (v, v2)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 12usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec30((mut v, mut v2)),
+                                  Repr::Spec32(a)) =>
+                                 Some(Repr::Spec30({
+                                                       {
+                                                           {
+                                                               v.push(a);
+                                                               (v, v2)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 13usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[2usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec30((mut v, mut v2)),
+                                  Repr::Spec33(pat), Repr::Spec32(a)) =>
+                                 Some(Repr::Spec30({
+                                                       {
+                                                           {
+                                                               v2.push((v.len(),
+                                                                        pat.unwrap()));
+                                                               v.push(a);
+                                                               (v, v2)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 14usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec32(a)) =>
+                                 Some(Repr::Spec31({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(a);
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 15usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec32(a), Repr::Spec31(mut v))
+                                 =>
+                                 Some(Repr::Spec31({
+                                                       {
+                                                           {
+                                                               v.insert(0, a);
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 16usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec1(i)) =>
+                                 Some(Repr::Spec32({
+                                                       {
+                                                           {
+                                                               NameExpr(i.name)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 17usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec32(a)) =>
+                                 Some(Repr::Spec32({
+                                                       {
+                                                           {
+                                                               ExprOptional(box() a)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 18usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[4usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec31(body), Repr::Spec31(sep))
+                                 =>
+                                 Some(Repr::Spec32({
+                                                       {
+                                                           {
+                                                               ExprSeq(body,
+                                                                       sep,
+                                                                       ast::ZeroOrMore)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 19usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec2(i)) =>
+                                 Some(Repr::Spec33({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(i);
+                                                               Some(quote_pat(cx,
+                                                                              v))
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 20usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec48(tts)) =>
+                                 Some(Repr::Spec33({
+                                                       {
+                                                           {
+                                                               Some(quote_pat(cx,
+                                                                              tts))
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 21usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec36(ty)) =>
+                                 Some(Repr::Spec34({ { { ty } } })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 22usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec44(block)) =>
+                                 Some(Repr::Spec35({
+                                                       {
+                                                           {
+                                                               InlineAction{block:
+                                                                                Some(block),}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 23usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec37(t)) =>
+                                 Some(Repr::Spec36({
+                                                       {
+                                                           {
+                                                               P(Ty{id:
+                                                                        ast::DUMMY_NODE_ID,
+                                                                    node: t,
+                                                                    span:
+                                                                        DUMMY_SP,})
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 24usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec38(path)) =>
+                                 Some(Repr::Spec37({
+                                                       {
+                                                           {
+                                                               TyPath(None,
+                                                                      path)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 25usize {
+                             match (true,) {
+                                 (true,) =>
+                                 Some(Repr::Spec37({
+                                                       {
+                                                           {
+                                                               TyTup(Vec::new())
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 26usize {
+                             match (true,) {
+                                 (true,) =>
+                                 Some(Repr::Spec37({ { { TyInfer } } })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 27usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec39(ps)) =>
+                                 Some(Repr::Spec38({
+                                                       {
+                                                           {
+                                                               ast::Path{global:
+                                                                             true,
+                                                                         segments:
+                                                                             ps,
+                                                                         span:
+                                                                             DUMMY_SP,}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 28usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec39(ps)) =>
+                                 Some(Repr::Spec38({
+                                                       {
+                                                           {
+                                                               ast::Path{global:
+                                                                             false,
+                                                                         segments:
+                                                                             ps,
+                                                                         span:
+                                                                             DUMMY_SP,}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 29usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[2usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec39(mut ps), Repr::Spec40(p))
+                                 =>
+                                 Some(Repr::Spec39({
+                                                       { { ps.push(p); ps } }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 30usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec40(p)) =>
+                                 Some(Repr::Spec39({
+                                                       {
+                                                           {
+                                                               let mut ps =
+                                                                   Vec::new();
+                                                               ps.push(p);
+                                                               ps
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 31usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec1(i)) =>
+                                 Some(Repr::Spec40({
+                                                       {
+                                                           {
+                                                               PathSegment{identifier:
+                                                                               i,
+                                                                           parameters:
+                                                                               PathParameters::none(),}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 32usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec1(i), Repr::Spec41(param))
+                                 =>
+                                 Some(Repr::Spec40({
+                                                       {
+                                                           {
+                                                               PathSegment{identifier:
+                                                                               i,
+                                                                           parameters:
+                                                                               param,}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 33usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec36(t)) =>
+                                 Some(Repr::Spec41({
+                                                       {
+                                                           {
+                                                               let mut ts =
+                                                                   Vec::new();
+                                                               ts.push(t);
+                                                               AngleBracketedParameters(AngleBracketedParameterData{lifetimes:
+                                                                                                                        Vec::new(),
+                                                                                                                    types:
+                                                                                                                        OwnedSlice::from_vec(ts),
+                                                                                                                    bindings:
+                                                                                                                        OwnedSlice::empty(),})
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 34usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec42(mut rs), Repr::Spec43(r))
+                                 =>
+                                 Some(Repr::Spec42({
+                                                       { { rs.push(r); rs } }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 35usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec43(r)) =>
+                                 Some(Repr::Spec42({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(r);
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 36usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[3usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[4usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec1(i), Repr::Spec34(ty),
+                                  Repr::Spec49(mut rhs), Repr::Spec35(b)) =>
+                                 Some(Repr::Spec43({
+                                                       {
+                                                           {
+                                                               let pat =
+                                                                   if rhs[1]
+                                                                          ==
+                                                                          Colon
+                                                                      {
+                                                                       let p =
+                                                                           quote_pat(cx,
+                                                                                     rhs.clone());
+                                                                       rhs.remove(0);
+                                                                       rhs.remove(0);
+                                                                       Some(p)
+                                                                   } else {
+                                                                       None
+                                                                   };
+                                                               L0Rule{name:
+                                                                          i.name,
+                                                                      ty: ty,
+                                                                      pat:
+                                                                          pat,
+                                                                      rhs:
+                                                                          rhs,
+                                                                      action:
+                                                                          b,}
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 37usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec47(tts)) =>
+                                 Some(Repr::Spec44({
+                                                       {
+                                                           {
+                                                               quote_block(cx,
+                                                                           tts)
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 38usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec47(tt)) =>
+                                 Some(Repr::Spec45({ { { tt } } })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 39usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec46(tt)) =>
+                                 Some(Repr::Spec45({ { { tt } } })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 40usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec21(t)) =>
+                                 Some(Repr::Spec46({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(t);
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 41usize {
+                             match (true,) {
+                                 (true,) =>
+                                 Some(Repr::Spec46({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(OpenDelim(Paren));
+                                                               v.push(CloseDelim(Paren));
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 42usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec48(tts)) =>
+                                 Some(Repr::Spec46({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(OpenDelim(Paren));
+                                                               v.extend(tts.into_iter());
+                                                               v.push(CloseDelim(Paren));
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 43usize {
+                             match (true,) {
+                                 (true,) =>
+                                 Some(Repr::Spec46({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(OpenDelim(Bracket));
+                                                               v.push(CloseDelim(Bracket));
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 44usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec48(tts)) =>
+                                 Some(Repr::Spec46({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(OpenDelim(Bracket));
+                                                               v.extend(tts.into_iter());
+                                                               v.push(CloseDelim(Bracket));
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 45usize {
+                             match (true,) {
+                                 (true,) =>
+                                 Some(Repr::Spec47({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(OpenDelim(Brace));
+                                                               v.push(CloseDelim(Brace));
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 46usize {
+                             match (true,
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec48(tts)) =>
+                                 Some(Repr::Spec47({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(OpenDelim(Brace));
+                                                               v.extend(tts.into_iter());
+                                                               v.push(CloseDelim(Brace));
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 47usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec45(tt)) =>
+                                 Some(Repr::Spec48({ { { tt } } })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 48usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec48(mut tts),
+                                  Repr::Spec45(tt)) =>
+                                 Some(Repr::Spec48({
+                                                       {
+                                                           {
+                                                               tts.extend(tt.into_iter());
+                                                               tts
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 49usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec46(tt)) =>
+                                 Some(Repr::Spec49({ { { tt } } })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 50usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec49(mut tts),
+                                  Repr::Spec46(tt)) =>
+                                 Some(Repr::Spec49({
+                                                       {
+                                                           {
+                                                               tts.extend(tt.into_iter());
+                                                               tts
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 51usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec22(a)) =>
+                                 Some(Repr::Spec50({
+                                                       {
+                                                           {
+                                                               let mut v =
+                                                                   Vec::new();
+                                                               v.push(a);
+                                                               v
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 52usize {
+                             match (true,
+                                    mem::replace(&mut args[0usize],
+                                                 Repr::Continue),
+                                    mem::replace(&mut args[1usize],
+                                                 Repr::Continue)) {
+                                 (true, Repr::Spec50(mut ary),
+                                  Repr::Spec22(a)) =>
+                                 Some(Repr::Spec50({
+                                                       {
+                                                           {
+                                                               ary.push(a);
+                                                               ary
+                                                           }
+                                                       }
+                                                   })),
+                                 _ => None,
+                             }
+                         } else if choice_ == 53usize {
+                             match (true,) {
+                                 (true,) => Some(Repr::Spec51({ { { } } })),
+                                 _ => None,
+                             }
+                         } else { None };
+                     r.expect("marpa-macros: internal error: eval") })
+        }
+    };
 
-    fn parse_rules_to_end(&mut self) -> Vec<Rule> {
+    let mut ast_ = None;
+    let mut namespace_ = None;
+    let mut discard_rule = None;
+
+    for mut ast in grammar.parses_iter(&tokens[..]) {
+        let mut namespace: HashMap<ast::Name, (u32, u32)> = HashMap::new();
+
         let mut rules = vec![];
-        while self.parser.token != token::Eof {
-            match self.parse_rule() {
-                Some(rule) => rules.push(rule),
-                None => ()
+        for (n, rule) in ast.rules.drain().enumerate() {
+            match namespace.entry(rule.name) {
+                Vacant(mut vacant) => {
+                    vacant.insert((1, rules.len() as u32));
+                    rules.push(rule);
+                }
+                Occupied(mut occupied) => {
+                    let &(x, y) = occupied.get();
+                    assert_eq!(x, 1);
+                    rules[y as usize].rhs.extend(rule.rhs.into_iter());
+                }
             }
         }
-        rules
-    }
+        ast.rules = rules;
 
-    fn build_conditional(&mut self,
-                         arg: Vec<(Option<InlineAction>, Vec<Option<InlineBind>>)>)
-                         -> P<ast::Expr> {
-        let mut cond_expr = quote_expr!(self.ext, panic!("unknown choice"));
-
-        for (n, (action, bounds)) in arg.into_iter().enumerate().rev() {
-            let (bounds_pat, stmts): (Vec<_>, Vec<_>) =
-            bounds.into_iter().enumerate().map(|(n, bind_opt)| {
-                if let Some(bind) = bind_opt {
-                    bind.pat_match(self, n)
-                } else {
-                    (self.ext.pat_wild(self.sp), None)
+        let mut rules = vec![];
+        for (n, rule) in ast.l0_rules.drain().enumerate() {
+            if rule.name.as_str() == "discard" {
+                discard_rule = Some(rule);
+                continue;
+            }
+            match namespace.entry(rule.name) {
+                Vacant(mut vacant) => {
+                    vacant.insert((0, rules.len() as u32));
+                    rules.push(rule);
                 }
-            }).unzip();
-
-            let (mut exprs, mut pats): (Vec<_>, Vec<_>) = stmts.into_iter().filter_map(|t| t).unzip();
-
-            let arg_pat = self.ext.pat(self.sp, ast::PatVec(
-                bounds_pat,
-                None,
-                vec![]
-            ));
-
-            pats.push(arg_pat);
-
-            let tup_pat = self.ext.pat_tuple(self.sp, pats);
-
-            exprs.push(quote_expr!(self.ext, args));
-
-            let tup_arg = self.ext.expr_tuple(self.sp, exprs);
-
-            let action_expr = if let Some(a) = action {
-                a.expr_wrap(self)
-            } else {
-                quote_expr!(self.ext, SlifRepr::ValLexed(arg_))
-            };
-
-            cond_expr = self.ext.expr_if(self.sp, quote_expr!(self.ext, choice_ == $n),
-                                       quote_expr!(self.ext, {
-                                            // $stmts
-                                            match $tup_arg {
-                                                $tup_pat => { $action_expr },
-                                                _ => unreachable!()
-                                            }
-                                       }),
-                                       Some(cond_expr));
+                Occupied(mut occupied) => {
+                    panic!("duplicate l0");
+                }
+            }
         }
+        ast.l0_rules = rules;
 
-        cond_expr
+        ast_ = Some(ast);
+        namespace_ = Some(namespace);
     }
+
+    (ast_.unwrap(), namespace_.unwrap(), discard_rule)
 }
 
 fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                   -> Box<MacResult+'static> {
-    let mut parser = parse::new_parser_from_tts(cx.parse_sess(),
-                                                cx.cfg(), tts.to_vec());
+    let sess = cx.parse_sess();
+    let mut trdr = lexer::new_tt_reader(&sess.span_diagnostic, None, None, tts.to_vec());
 
-    let mut ctxt = Context {
-        ext: &mut *cx,
-        sp: sp,
-        parser: parser,
-        val_reprs: HashSet::new(),
-        explicit_tys: HashMap::new(),
-        syms: StrInterner::new(),
-        lexer: None,
-    };
-
-    let mut g1_rules = ctxt.parse_rules_to_end();
-
-    debug!("Parsed: {:?}", g1_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
-
-    // prepare grammar rules
-
-    // pass 1: extract sub-rules
-    let mut g1_extracted_rules = vec![];
-    for rule in g1_rules.iter_mut() {
-        rule.extract_sub_rules(&mut ctxt, &mut g1_extracted_rules);
-    }
-    g1_rules.extend(g1_extracted_rules.into_iter());
-
-    // pass 2: extract l0
-    let mut l0_rules = vec![];
-    let mut l0_discard_rules = vec![];
-
-    let mut g1_rules = g1_rules.into_iter().filter_map(|rule| {
-        match rule {
-            Rule { rhs: Lexeme(rhs), name } => {
-                if &*ctxt.syms.get(name) == "discard" {
-                    l0_discard_rules.push(rhs.tts);
-                } else {
-                    ctxt.val_reprs.insert(StrSlice);
-                    l0_rules.push(Rule { rhs: Lexeme(rhs), name: name });
-                }
-
-                None
+    let mut tokens = vec![];
+    let mut tok = transcribe::tt_next_token(&mut trdr).tok;
+    while tok != Eof {
+        let t = mem::replace(&mut tok, transcribe::tt_next_token(&mut trdr).tok);
+        match t {
+            OpenDelim(..) | CloseDelim(..) => {
+                tokens.push(RustToken::Delim(t));
             }
-            other => Some(other)
-        }
-    }).flat_map(|rule| {
-        // pass 3: flatten alternatives
-        rule.alternatives().into_iter()
-    }).collect::<Vec<_>>();
-
-    debug!("For lexing: {}", l0_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
-
-    // pass 4: sequences
-    let mut g1_seq_rules = vec![];
-    for rule in g1_rules.iter_mut() {
-        rule.create_seq_rules(&mut ctxt.syms, &mut g1_seq_rules);
-    }
-    debug!("Sequence rules: {}", g1_seq_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
-
-    let match_ty_return_val;
-
-    let ty_return = match &g1_rules[0].rhs {
-        &Sequence(_, ref action) => {
-            let ty_return = action.as_ref().map(|a| a.ty_return).unwrap_or(InferT);
-            // if ty_return
-
-            let pat_val = ctxt.ext.pat_ident(ctxt.sp, token::str_to_ident("val"));
-            match_ty_return_val = ty_return.pat_match(&mut ctxt, pat_val);
-
-            match ty_return {
-                Explicit(n) => ctxt.explicit_tys.iter().find(|&(ty, v)| *v == n).map(|(ty, v)| ty.clone()).unwrap(),
-                StrSlice => quote_ty!(ctxt.ext, &'a str),
-                InferT => quote_ty!(ctxt.ext, T),
-                _ => unreachable!()
-            }
-        }
-        _ => { unreachable!() }
-    };
-
-    let mut rule_alt_tys = HashMap::new();
-
-    for rule in g1_rules.iter().chain(g1_seq_rules.iter()).chain(l0_rules.iter()) {
-        rule.join_action_ty(&mut rule_alt_tys);
-    }
-
-    // LEXER -- L0
-    // Lexer regexstr
-
-    let mut l0_inline_actions = vec![];
-    let mut l0_names = vec![];
-    let (scan_id_exprs, reg_alts): (Vec<P<ast::Expr>>, Vec<Vec<ast::TokenTree>>) =
-    l0_rules.into_iter().map(|rule| {
-        if let Rule { rhs: Lexeme(mut lex), name } = rule {
-            l0_inline_actions.push((lex.action.take(), vec![lex.bind.take()]));
-
-            l0_names.push(ctxt.syms.get(name));
-            // let regstr = &lex.regstr.to_string()[];
-            // let regstr = ctxt.ext.expr_lit(sp, ast::LitStr(token::intern_and_get_ident(regstr), ast::RawStr(2)));
-            let tts = lex.tts;
-            (ctxt.ext.expr_usize(sp, name.usize()), quote_tokens!(ctxt.ext, $tts,))
-        } else {
-            unreachable!()
-        }
-    }).unzip();
-
-    let l0_names: Vec<P<ast::Expr>> = l0_names.into_iter().map(|rcstr| {
-        let s = &rcstr[..];
-        ctxt.ext.expr_str(sp, token::intern_and_get_ident(s))
-    }).collect();
-    let l0_names = ctxt.ext.expr_vec(sp, l0_names);
-
-    let num_scan_syms = scan_id_exprs.len();
-    // ``` [$l0_sym_id0, $l0_sym_id1, ...] ```
-    let scan_id_ary = ctxt.ext.expr_vec(sp, scan_id_exprs);
-    // let discard_rule = ctxt.ext.expr_lit(sp, ast::LitStr(token::intern_and_get_ident(&l0_discard_rules[0][]), ast::RawStr(2)));
-    let discard_rule = l0_discard_rules;
-
-    let num_syms = ctxt.syms.len();
-
-    // ``` if tok_kind == 0 { $block } else if ... ```
-    let lex_cond_expr = ctxt.build_conditional(l0_inline_actions);
-
-    let (lexer, lexer_opt) =
-        ctxt.lexer.take().unwrap_or_else(|| (token::str_to_ident("regex_scanner"), vec![]));
-
-    // RULES -- G1
-    let mut rhs_exprs = vec![];
-
-    for rule in g1_rules.iter_mut().chain(g1_seq_rules.iter_mut()) {
-        rule.infer_action_ty(&rule_alt_tys);
-    }
-
-    debug!("G1 rules inferred: {}", g1_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
-    debug!("Sequence rules inferred: {}", g1_seq_rules.iter().fold(String::new(), |s, r| format!("{}\n{:?}", s, r)));
-
-    let (rule_exprs, rule_actions): (Vec<_>, Vec<_>) =
-    g1_rules.into_iter().chain(g1_seq_rules.into_iter()).map(|rule| {
-        let rblk = match rule.rhs {
-            Sequence(seq, action) => {
-                let mut bounds = vec![];
-                rhs_exprs.extend(seq.into_iter().map(|node|
-                    match node {
-                        Ident(name, bind) => {
-                            bounds.push(bind);
-                            let id = name.usize();
-                            quote_expr!(ctxt.ext, syms[$id])
-                        }
-                        _ => panic!("not an ident in a sequence")
-                    }
-                ));
-                (action, bounds)
-            }
-            Ident(rhs_sym, bound_with) => {
-                let rhs_id = rhs_sym.usize();
-                rhs_exprs.push(quote_expr!(ctxt.ext, syms[$rhs_id]));
-
-                (Some(InlineAction {
-                    block: ctxt.ext.block_expr(quote_expr!(ctxt.ext, ())),
-                    ty_return: Continue,
-                 }),
-                 vec![bound_with])
-            }
-            // &Lexeme(ref s)
-            _ => panic!("not an ident or seq or lexeme")
-        };
-
-        let lhs = rule.name.usize();
-
-        return (
-            ctxt.ext.expr_tuple(sp, vec![
-                quote_expr!(ctxt.ext, syms[$lhs]),
-                ctxt.ext.expr_vec_slice(sp, mem::replace(&mut rhs_exprs, vec![])),
-            ]),
-            rblk
-        );
-    }).unzip();
-
-    // ``` [$rule_exprs] ```
-    let num_rules = rule_exprs.len();
-    let rules_expr = ctxt.ext.expr_vec(sp, rule_exprs);
-
-    // ``` if rule == self.rule_ids[$x] { $block } ```
-    let rule_cond_expr = ctxt.build_conditional(rule_actions);
-
-    // Generated code
-
-    debug!("Reprs {:?}, tys:", ctxt.val_reprs);
-    for (ty, n_ty) in ctxt.explicit_tys.iter() {
-        debug!("{} => {}", n_ty, pprust::ty_to_string(&**ty));
-    }
-
-    let mut variants = ctxt.explicit_tys.iter().map(|(ty, n_ty)| {
-        let n_ty_s = format!("Spec{}", n_ty);
-        let variant_name = token::str_to_ident(&n_ty_s[..]);
-        quote_tokens!(ctxt.ext, $variant_name($ty),)
-    }).collect::<Vec<_>>();
-
-    let mut T = None;
-
-    if ctxt.val_reprs.contains(&InferT) {
-        variants.push(quote_tokens!(ctxt.ext, ValInfer(T),));
-        T = Some(quote_tokens!(ctxt.ext, T,));
-    }
-
-    if ctxt.val_reprs.contains(&StrSlice) {
-        variants.push(quote_tokens!(ctxt.ext, ValLexed(lexer::$lexer::Output<'a>),));
-    }
-
-    let fn_parse_expr = quote_expr!(ctxt.ext, {
-        let mut recce = ::marpa::Recognizer::new(&mut self.grammar).unwrap();
-        recce.start_input();
-
-        let mut lex_parse = self.lexer.new_parse(input);
-
-        let mut positions = vec![];
-        let l0_names = $l0_names;
-
-        let mut ith = 0;
-
-        while !lex_parse.is_empty() {
-            let mut syms: [Symbol; $num_scan_syms] = unsafe { mem::uninitialized() };
-            let mut terminals_expected: [u32; $num_scan_syms] = unsafe { mem::uninitialized() };
-            let terminal_ids_expected = unsafe {
-                recce.terminals_expected(&mut syms[])
-            };
-            let terminals_expected = &mut terminals_expected[..terminal_ids_expected.len()];
-            for (&id, terminal) in terminal_ids_expected.iter().zip(terminals_expected.iter_mut()) {
-                // TODO optimize find
-                *terminal = self.scan_syms.iter().position(|&sym| sym == id).unwrap() as u32;
-            }
-
-            let mut iter = match lex_parse.longest_parses_iter(terminals_expected) {
-                Some(iter) => iter,
-                None => break
-            };
-
-            // println!("#{}", iter.len());
-            for token in iter {
-                let expected: Vec<&str> = terminals_expected.iter().map(|&i| l0_names[i as usize]).collect();
-                match recce.alternative(self.scan_syms[token.sym()], positions.len() as i32 + 1, 1) {
-                    ErrorCode::UnexpectedTokenId => {
-                        // println!("{}: expected {:?}, but found {}", ith, expected, l0_names[token.sym()]);
-                    }
-                    _ => {
-                        // println!("{}: expected {:?}, ACCEPTED {}", ith, expected, l0_names[token.sym()]);
-                    }
-                }
-                positions.push(token); // TODO optimize
-            }
-            recce.earleme_complete();
-            ith += 1;
-        }
-
-        // println!("{:?}", positions.len());
-
-        let latest_es = recce.latest_earley_set();
-
-        let mut tree =
-            ::marpa::Bocage::new(&mut recce, latest_es)
-         .and_then(|mut bocage|
-            ::marpa::Order::new(&mut bocage)
-        ).and_then(|mut order|
-            ::marpa::Tree::new(&mut order)
-        );
-
-        SlifParse {
-            tree: tree.unwrap(),
-            lex_parse: lex_parse,
-            positions: positions,
-            stack: vec![],
-            parent: self,
-        }
-    });
-
-    let slif_iter_next_expr = quote_expr!(ctxt.ext, {
-        let mut valuator = if self.tree.next() >= 0 {
-            Value::new(&mut self.tree).unwrap()
-        } else {
-            return None;
-        };
-        for &rule in self.parent.rule_ids.iter() {
-            valuator.rule_is_valued_set(rule, 1);
-        }
-
-        loop {
-            match valuator.step() {
-                Step::StepToken => {
-                    let idx = valuator.token_value() as usize - 1;
-                    let elem = self.parent.lex_closure.call_mut(self.lex_parse.get(&self.positions[], idx));
-                    self.stack_put(valuator.result() as usize, elem);
-                }
-                Step::StepRule => {
-                    let rule = valuator.rule();
-                    let arg_0 = valuator.arg_0() as usize;
-                    let arg_n = valuator.arg_n() as usize;
-                    let elem = {
-                        let slice = self.stack.slice_mut(arg_0, arg_n + 1);
-                        let choice = self.parent.rule_ids.iter().position(|r| *r == rule);
-                        self.parent.parse_closure.call_mut((slice,
-                                                            choice.expect("unknown rule")))
-                    };
-                    match elem {
-                        SlifRepr::Continue => {
-                            continue
-                        }
-                        other_elem => {
-                            self.stack_put(arg_0, other_elem);
-                        }
-                    }
-                }
-                // Step::StepNullingSymbol => {
-                //     // let rule = valuator.rule();
-                //     // let elem = {
-                //     //     let slice: &mut [SlifRepr] = &mut [];
-                //     //     let choice = self.parent.rule_ids.iter().position(|r| *r == rule);
-                //     //     self.parent.parse_closure.call_mut((slice, choice.expect("unknown rule")))
-                //     // };
-                //     // match elem {
-                //     //     SlifRepr::Continue => {
-                //     //         continue
-                //     //     }
-                //     //     other_elem => {
-                //     //         self.stack_put(valuator.result() as usize, other_elem);
-                //     //     }
-                //     // }
-                //     break;
-                // }
-                Step::StepInactive => {
-                    break;
-                }
-                other => panic!("unexpected step {:?}", other),
-            }
-        }
-
-        // println!("{:?}", self.stack.capacity());
-
-        let result = self.stack.drain().next();
-
-        match result {
-            Some($match_ty_return_val) => Some(val),
             _ => {
-                None
+                tokens.push(RustToken::Tok(t));
             }
         }
-    });
+    }
 
-    let slif_expr = quote_expr!(ctxt.ext, {
-        use marpa::{Tree, Symbol, Value, Step, ErrorCode};
-        use marpa::marpa::Values;
-        use std::mem;
-        // pub use self::*;
+    let mac = MacEager::expr(quote_expr!(cx, unreachable!()));
 
-        mod lexer {
-            // pub use self::lexer_::$lexer::*;
-            // mod lexer_ {
-                // pub use super::super::Token2;
-                pub use super::*;
-                $lexer!($lexer_opt ; $discard_rule, $reg_alts);
-            // }
+    // call
+    let (mut ast, mut namespace, discard_rule) = parse_ast(cx, &tokens[..]);
+
+    let rules_offset = ast.rules.len();
+
+    let mut new_rules_tmp = vec![];
+    let mut seq_rules = vec![];
+
+    {
+        let mut cx = ExtractionContext {
+            namespace: &mut namespace,
+            l0_types: ast.l0_rules.iter().map(|r| r.ty.clone()).collect(),
+            types: ast.rules.iter().map(|r| r.ty.clone()).collect(),
+            sp: sp,
+            ext: cx,
+        };
+
+        for rule in &mut ast.rules {
+            let (new_rules, new_seqs) = rule.extract(&mut cx);
+            for (n, new_rule) in new_rules.into_iter().enumerate() {
+                cx.namespace.insert(new_rule.name, (1, rules_offset as u32 + new_rules_tmp.len() as u32));
+                new_rules_tmp.push(new_rule);
+            }
+
+            seq_rules.extend(new_seqs.into_iter());
         }
+    };
 
-        struct SlifGrammar<C, D, $T> {
-            grammar: ::marpa::Grammar,
-            scan_syms: [Symbol; $num_scan_syms],
-            rule_ids: [marpa::Rule; $num_rules],
-            lexer: lexer::$lexer::Lexer,
-            lex_closure: C,
-            parse_closure: D,
+    ast.rules.extend(new_rules_tmp.into_iter());
+
+    for (n, new_rule) in seq_rules.iter().enumerate() {
+        namespace.insert(new_rule.name, (2, n as u32));
+    }
+
+    let (variant_names, variant_tys): (Vec<_>, Vec<_>) =
+            ast.l0_rules.iter().map(|r| &r.ty)
+                .chain(ast.rules.iter().map(|r| &r.ty))
+                .chain(seq_rules.iter().map(|r| &r.ty))
+                .enumerate().map(|(n, ty)| {
+        (repr_variant(n as u32), ty.clone())
+    }).unzip();
+
+    let num_syms = ast.l0_rules.len() + ast.rules.len() + seq_rules.len();
+    let num_scan_syms = ast.l0_rules.len();
+    let num_rule_alts = ast.rules.iter().map(|rule| rule.rhs.len()).sum();
+    let num_rules = ast.rules.len();
+    let num_seq_rules = seq_rules.len();
+    let num_rule_ids = num_rule_alts + num_seq_rules;
+    let offset_rules = ast.l0_rules.len();
+    let offset_seq_rules = ast.l0_rules.len() + ast.rules.len();
+
+    // renumerate
+    for (_, &mut (kind, ref mut nth)) in namespace.iter_mut() {
+        if kind == 1 {
+            *nth += offset_rules as u32;
+        } else if kind == 2 {
+            *nth += offset_seq_rules as u32;
         }
+    }
 
-        struct SlifParse<'a, 'b, C: 'b, D: 'b, $T> {
-            tree: Tree,
-            lex_parse: lexer::$lexer::LexerParse<'a, 'b>,
-            positions: Vec<lexer::$lexer::Token>,
-            stack: Vec<SlifRepr<'a, $T>>,
-            parent: &'b mut SlifGrammar<C, D, $T>,
+    let mut seq_rule_names = vec![];
+    let mut seq_rule_rhs = vec![];
+    let mut seq_rule_separators = vec![];
+
+    let mut rule_seq_cond_n = vec![];
+    let mut rule_seq_action_c = vec![];
+    let mut rule_seq_value_c = vec![];
+
+    // all produced sequences
+    for (n, rule) in seq_rules.iter().enumerate() {
+        seq_rule_names.push(n + offset_seq_rules);
+        seq_rule_rhs.push(namespace[rule.rhs].1 as usize);
+        seq_rule_separators.push(namespace[rule.sep].1 as usize);
+        rule_seq_cond_n.push(num_rule_alts + n);
+        rule_seq_action_c.push(repr_variant((n + offset_seq_rules) as u32));
+        rule_seq_value_c.push(repr_variant(namespace[rule.rhs].1));
+    }
+
+    let rules = ast.rules.iter().flat_map(|rule| {
+        rule.rhs.iter().map(|alt| {
+            alt.inner.iter().map(|expr| {
+                namespace[expr.name()].1 as usize
+            }).collect::<Vec<_>>()
+        })
+    }).collect::<Vec<_>>();
+
+    let rule_names = ast.rules.iter().flat_map(|rule| {
+        iter::repeat(namespace[rule.name].1 as usize).take(rule.rhs.len())
+    }).collect::<Vec<_>>();
+
+    let ty_return = ast.rules[0].ty.clone();
+
+    let mut lex_cond_n = vec![];
+    let mut lex_tup_pat = vec![];
+    let mut lex_action = vec![];
+    let mut lex_action_c = vec![];
+    let mut lexer_tts = vec![];
+    let mut discard_rule = discard_rule.map(|rule| quote_tokens(cx, rule.rhs))
+                                       .into_iter()
+                                       .collect::<Vec<_>>();
+
+    for (nth, rule) in ast.l0_rules.iter().enumerate() {
+        lex_cond_n.push(nth);
+        lex_tup_pat.push(rule.pat.clone().unwrap_or_else(|| cx.pat_wild(sp)));
+        lex_action.push(rule.action.block.clone().unwrap());
+        lex_action_c.push(repr_variant(nth as u32));
+        lexer_tts.push(quote_tokens(cx, rule.rhs.clone()));
+    }
+
+    let mut rule_cond_n = vec![];
+    let mut rule_tup_nth = vec![];
+    let mut rule_tup_variant = vec![];
+    let mut rule_tup_pat = vec![];
+    let mut rule_action = vec![];
+    let mut rule_action_c = vec![];
+    let mut rule_nulling_offset: usize = 0;
+
+    let mut rule_nulling_rule_id = vec![];
+    let mut rule_nulling_cond_n = vec![];
+    let mut rule_nulling_action = vec![];
+    let mut rule_nulling_action_c = vec![];
+
+    let mut i_n: usize = 0;
+    for (nr, rule) in ast.rules.iter().enumerate() {
+        for subrule in rule.rhs.iter() {
+            if subrule.inner.is_empty() {
+                rule_nulling_cond_n.push(i_n);
+                rule_nulling_rule_id.push(i_n);
+                rule_nulling_action.push(subrule.action.block.clone().unwrap());
+                rule_nulling_action_c.push(repr_variant((nr + offset_rules) as u32));
+            } else {
+                rule_cond_n.push(i_n);
+                rule_action.push(subrule.action.block.clone().unwrap());
+                rule_action_c.push(repr_variant((nr + offset_rules) as u32));
+
+                let &Alternative {
+                    ref inner,
+                    ref pats,
+                    ..
+                } = subrule;
+
+                let (mut tup_nth, mut tup_variant, mut tup_pat) = (vec![], vec![], vec![]);
+                for &(nth, ref pat) in pats.iter() {
+                    let variant_name = match &inner[nth] { &NameExpr(name) => name, _ => unreachable!() };
+                    let variant_name = repr_variant(namespace[variant_name].1);
+                    tup_nth.push(nth);
+                    tup_variant.push(variant_name);
+                    tup_pat.push(pat.clone());
+                }
+                rule_tup_nth.push(tup_nth);
+                rule_tup_variant.push(tup_variant);
+                rule_tup_pat.push(tup_pat);
+            }
+            i_n += 1;
         }
+    }
 
-        enum SlifRepr<'a, $T> {
+    let num_nulling_syms = rule_nulling_rule_id.len();
+
+    let (lexer, lexer_opt) = ast.options.iter().map(|o| (o.ident, o.tokens.clone()))
+                                               .next()
+                                               .unwrap_or_else(|| (token::str_to_ident("regex_scanner"), vec![]));
+
+    let start_variant = repr_variant(offset_rules as u32);
+
+    let Token = gensym_ident("Token_");
+
+    // quote the code
+    let grammar_expr = quote_tokens!(cx, {
+        enum Repr<'a> {
             Continue, // also a placeholder
-            $variants
+            Unused(PhantomData<&'a ()>),
+            $( $variant_names($variant_tys), )*
         }
 
-        impl<C, D, $T> SlifGrammar<C, D, $T>
-                where C: for<'c> FnMut(lexer::$lexer::Output<'c>, usize) -> SlifRepr<'c, $T>,
-                      D: for<'c> FnMut(&mut [SlifRepr<'c, $T>], usize) -> SlifRepr<'c, $T>,
+        struct Grammar<F, G, L> {
+            grammar: ::marpa::Grammar,
+            scan_syms: [::marpa::Symbol; $num_scan_syms],
+            nulling_syms: [(::marpa::Symbol, u32); $num_nulling_syms],
+            rule_ids: [::marpa::Rule; $num_rule_ids],
+            lexer: L,
+            lex_closure: F,
+            eval_closure: G,
+        }
+
+        struct Parses<'a, 'b, F: 'b, G: 'b, L: 'b> {
+            tree: ::marpa::Tree,
+            lex_parse: LPar<'a, 'b>,
+            positions: Vec<$Token>,
+            stack: Vec<Repr<'a>>,
+            parent: &'b mut Grammar<F, G, L>,
+        }
+
+        impl<F, G, L: Lexer> Grammar<F, G, L>
+            where F: for<'c> FnMut(LOut<'c>, usize) -> Repr<'c>,
+                  G: for<'c> FnMut(&mut [Repr<'c>], usize) -> Repr<'c>,
         {
-            #[inline]
-            fn new(closures: (C, D)) -> SlifGrammar<C, D, $T> {
-                let mut cfg = ::marpa::Config::new();
+            fn new(lexer: L, lex_closure: F, eval_closure: G) -> Grammar<F, G, L> {
+                use marpa::{Config, Symbol, Rule};
+                let mut cfg = Config::new();
                 let mut grammar = ::marpa::Grammar::with_config(&mut cfg).unwrap();
 
-                let mut syms: [::marpa::Symbol; $num_syms] = unsafe { ::std::mem::uninitialized() };
-                for sym in syms.iter_mut() { *sym = grammar.symbol_new().unwrap(); }
-                grammar.start_symbol_set(syms[0]);
+                let mut syms: [Symbol; $num_syms] = unsafe { ::std::mem::uninitialized() };
+                for s in syms.iter_mut() {
+                    *s = grammar.symbol_new().unwrap();
+                }
+                grammar.start_symbol_set(syms[$offset_rules]);
 
-                let rules: [(::marpa::Symbol, &[::marpa::Symbol]); $num_rules] = $rules_expr;
-
-                let scan_id_ary = $scan_id_ary;
                 let mut scan_syms: [Symbol; $num_scan_syms] = unsafe { ::std::mem::uninitialized() };
-                for (sym, idx) in scan_syms.iter_mut().zip(scan_id_ary.iter()) {
-                    *sym = syms[*idx];
+                for (dst, src) in scan_syms.iter_mut().zip(syms[..$num_scan_syms].iter()) {
+                    *dst = *src;
                 }
 
-                let mut rule_ids: [::marpa::marpa::Rule; $num_rules] = unsafe { ::std::mem::uninitialized() };
-                for (&(lhs, rhs), id) in rules.iter().zip(rule_ids.iter_mut()) {
-                    *id = grammar.rule_new(lhs, rhs).unwrap();
+                let rules: [(Symbol, &[Symbol]); $num_rule_alts] = [ $(
+                    (syms[$rule_names],
+                     &[ $(
+                        syms[$rules],
+                     )* ]),
+                )* ];
+
+                let seq_rules: [(Symbol, Symbol, Symbol); $num_seq_rules] = [ $(
+                    (syms[$seq_rule_names],
+                     syms[$seq_rule_rhs],
+                     syms[$seq_rule_separators])
+                )* ];
+
+                let mut rule_ids: [Rule; $num_rule_ids] = unsafe { ::std::mem::uninitialized() };
+                
+                {
+                    for (dst, &(lhs, rhs)) in rule_ids.iter_mut().zip(rules.iter()) {
+                        *dst = grammar.rule_new(lhs, rhs).unwrap() ;
+                    }
+                    for (dst, &(lhs, rhs, sep)) in rule_ids.iter_mut().skip($num_rule_alts).zip(seq_rules.iter()) {
+                        *dst = grammar.sequence_new(lhs, rhs, sep).unwrap();
+                    }
+                };
+
+                let mut nulling_syms: [(Symbol, u32); $num_nulling_syms] = unsafe { ::std::mem::uninitialized() };
+                let nulling_rule_id_n: &[usize] = &[$($rule_nulling_rule_id,)*];
+                for (dst, &n) in nulling_syms.iter_mut().zip(nulling_rule_id_n.iter()) {
+                    *dst = (rules[n].0, n as u32);
                 }
+
                 grammar.precompute().unwrap();
 
-                SlifGrammar {
+                Grammar {
+                    lexer: lexer,
+                    lex_closure: lex_closure,
+                    eval_closure: eval_closure,
                     grammar: grammar,
                     scan_syms: scan_syms,
+                    nulling_syms: nulling_syms,
                     rule_ids: rule_ids,
-                    lexer: lexer::$lexer::Lexer::new(),
-                    lex_closure: closures.0,
-                    parse_closure: closures.1,
                 }
             }
 
             #[inline]
-            fn parses_iter<'a, 'b>(&'b mut self, input: lexer::$lexer::Input<'a>) -> SlifParse<'a, 'b, C, D, $T> {
-                $fn_parse_expr
+            fn parses_iter<'a, 'b>(&'b mut self, input: LInp<'a>) -> Parses<'a, 'b, F, G, L> {
+                use marpa::{Recognizer, Bocage, Order, Tree, Symbol, ErrorCode};
+                let mut recce = Recognizer::new(&mut self.grammar).unwrap();
+                recce.start_input();
+
+                let mut lex_parse = self.lexer.new_parse(input);
+
+                let mut positions = vec![];
+
+                let mut ith = 0;
+
+                while !lex_parse.is_empty() {
+                    let mut syms: [Symbol; $num_scan_syms] = unsafe { mem::uninitialized() };
+                    let mut terminals_expected: [u32; $num_scan_syms] = unsafe { mem::uninitialized() };
+                    let terminal_ids_expected = unsafe {
+                        recce.terminals_expected(&mut syms[..])
+                    };
+                    let terminals_expected = &mut terminals_expected[..terminal_ids_expected.len()];
+                    for (terminal, &id) in terminals_expected.iter_mut().zip(terminal_ids_expected.iter()) {
+                        // TODO optimize find
+                        *terminal = self.scan_syms.iter().position(|&sym| sym == id).unwrap() as u32;
+                    }
+
+                    let mut iter = match lex_parse.longest_parses_iter(terminals_expected) {
+                        Some(iter) => iter,
+                        None => break
+                    };
+
+                    for token in iter {
+                        // let expected: Vec<&str> = terminals_expected.iter().map(|&i| l0_names[i as usize]).collect();
+                        recce.alternative(self.scan_syms[token.sym()], positions.len() as i32 + 1, 1);
+                        positions.push(token); // TODO optimize
+                    }
+                    recce.earleme_complete();
+                    ith += 1;
+                }
+
+                let latest_es = recce.latest_earley_set();
+
+                let mut tree =
+                    Bocage::new(&mut recce, latest_es)
+                 .and_then(|mut bocage|
+                    Order::new(&mut bocage)
+                ).and_then(|mut order|
+                    Tree::new(&mut order)
+                );
+
+                Parses {
+                    tree: tree.unwrap(),
+                    lex_parse: lex_parse,
+                    positions: positions,
+                    stack: vec![],
+                    parent: self,
+                }
             }
         }
 
-        impl<'a, 'b, C, D, $T> Iterator for SlifParse<'a, 'b, C, D, $T>
-                where C: for<'c> FnMut(lexer::$lexer::Output<'c>, usize) -> SlifRepr<'c, $T>,
-                      D: for<'c> FnMut(&mut [SlifRepr<'c, $T>], usize) -> SlifRepr<'c, $T>,
+        impl<'a, 'b, F, G, L> Iterator for Parses<'a, 'b, F, G, L>
+            where F: for<'c> FnMut(LOut<'c>, usize) -> Repr<'c>,
+                  G: for<'c> FnMut(&mut [Repr<'c>], usize) -> Repr<'c>,
         {
             type Item = $ty_return;
 
             fn next(&mut self) -> Option<$ty_return> {
-                $slif_iter_next_expr
+                use marpa::{Step, Value};
+                let mut valuator = if self.tree.next() >= 0 {
+                    Value::new(&mut self.tree).unwrap()
+                } else {
+                    return None;
+                };
+                for &rule in self.parent.rule_ids.iter() {
+                    valuator.rule_is_valued_set(rule, 1);
+                }
+
+                loop {
+                    match valuator.step() {
+                        Step::StepToken => {
+                            let idx = valuator.token_value() as usize - 1;
+                            let elem = self.parent.lex_closure.call_mut(self.lex_parse.get(&self.positions[..], idx));
+                            self.stack_put(valuator.result() as usize, elem);
+                        }
+                        Step::StepRule => {
+                            let rule = valuator.rule();
+                            let arg_0 = valuator.arg_0() as usize;
+                            let arg_n = valuator.arg_n() as usize;
+                            let elem = {
+                                let slice = self.stack.slice_mut(arg_0, arg_n + 1);
+                                let choice = self.parent.rule_ids.iter().position(|r| *r == rule);
+                                self.parent.eval_closure.call_mut((slice,
+                                                                    choice.expect("unknown rule")))
+                            };
+                            match elem {
+                                Repr::Continue => {
+                                    continue
+                                }
+                                other_elem => {
+                                    self.stack_put(arg_0, other_elem);
+                                }
+                            }
+                        }
+                        Step::StepNullingSymbol => {
+                            let sym = valuator.symbol();
+                            let choice = self.parent.nulling_syms.iter().find(|&&(s, _)| s == sym).expect("unknown nulling sym").1;
+                            let elem = self.parent.eval_closure.call_mut((&mut [], choice as usize));
+                            self.stack_put(valuator.result() as usize, elem);
+                        }
+                        Step::StepInactive => {
+                            break;
+                        }
+                        other => panic!("unexpected step {:?}", other),
+                    }
+                }
+
+                let result = self.stack.drain().next();
+
+                match result {
+                    Some(Repr::$start_variant(val)) =>
+                        Some(val),
+                    _ =>
+                        None,
+                }
             }
         }
 
-        impl<'a, 'b, C, D, $T> SlifParse<'a, 'b, C, D, $T> {
-            fn stack_put(&mut self, idx: usize, elem: SlifRepr<'a, $T>) {
+        impl<'a, 'b, F, G, L> Parses<'a, 'b, F, G, L> {
+            fn stack_put(&mut self, idx: usize, elem: Repr<'a>) {
                 if idx == self.stack.len() {
                     self.stack.push(elem);
                 } else {
@@ -1041,30 +2271,58 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
             }
         }
 
-        SlifGrammar::new((
-            |arg_, choice_| {
-                let args: &[_] = &[arg_];
-                $lex_cond_expr
+        Grammar::new(
+            new_lexer(),
+            |arg, choice_| {
+                let r = match (true, arg) {
+                    $((true, $lex_tup_pat) if choice_ == $lex_cond_n => Some(Repr::$lex_action_c($lex_action)),)*
+                    _ => None
+                };
+                r.expect("marpa-macros: internal error: lexing")
             },
             |args, choice_| {
-                $rule_cond_expr
+                let r = $(
+                    if choice_ == $rule_cond_n {
+                        match ( true, $( mem::replace(&mut args[$rule_tup_nth], Repr::Continue), )* ) {
+                            ( true, $( Repr::$rule_tup_variant($rule_tup_pat), )* ) => Some(Repr::$rule_action_c($rule_action)),
+                            _ => None
+                        }
+                    } else
+                )+
+                $(
+                    if choice_ == $rule_nulling_cond_n {
+                        Some(Repr::$rule_nulling_action_c($rule_nulling_action))
+                    } else
+                )*
+                $(
+                    if choice_ == $rule_seq_cond_n {
+                        let v = args.iter_mut().enumerate().filter_map(|(n, arg)|
+                            if n & 1 == 0 {
+                                match (true, mem::replace(arg, Repr::Continue)) {
+                                    (true, Repr::$rule_seq_value_c(elem)) => Some(elem),
+                                    _ => None
+                                }
+                            } else {
+                                None
+                            }
+                        ).collect::<Vec<_>>();
+                        if v.len() == args.len() / 2 {
+                            Some(Repr::$rule_seq_action_c(v))
+                        } else {
+                            None
+                        }
+                    } else
+                )* {
+                    None
+                };
+                r.expect("marpa-macros: internal error: eval")
             },
-        ))
+        )
     });
 
-    debug!("{}", pprust::expr_to_string(&*slif_expr));
+    let grammar_expr = quote_expr!(cx, {
+        $lexer!($Token $lexer_opt ; $($($discard_rule)*)*, $( $lexer_tts, )* ; $grammar_expr)
+    });
 
-    MacEager::expr(slif_expr)
-}
-
-// Debugging
-
-impl fmt::Debug for InlineAction {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        try!(fmt.write_fmt(format_args!("InlineAction {{ block: {}, ty_return: ",
-                           pprust::block_to_string(&*self.block))));
-        try!(self.ty_return.fmt(fmt));
-        try!(fmt.write_str(" }}"));
-        Ok(())
-    }
+    MacEager::expr(grammar_expr)
 }
