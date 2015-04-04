@@ -1,6 +1,6 @@
 [package]
 
-name = "rust-marpa-macros"
+name = "rust-marpa-macros-stage-minus-one"
 version = "0.0.1"
 authors = [ "pioczarn@gmail.com" ]
 
@@ -10,10 +10,4 @@ crate_type = ["dylib"]
 plugin = true
 
 [dependencies.rust-marpa]
-path = ".."
-
-[dependencies.rust-marpa-macros-stage2]
-path = "stage2"
-
-[dependencies.enum-adaptor]
-path = "../enum-adaptor"
+path = "../.."
