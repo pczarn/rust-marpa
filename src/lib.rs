@@ -1,10 +1,10 @@
 #![crate_name = "marpa"]
 
-#![feature(plugin_registrar, macro_rules, unsafe_destructor, associated_types)]
+#![feature(plugin_registrar, unsafe_destructor, libc)]
 
 extern crate libc;
 
-pub use ffi::{Config, Step};
+pub use ffi::{Config, Step, ErrorCode};
 pub use marpa::{Grammar, Bocage, Order, Recognizer, Tree, Value, Symbol, Rule};
 
 pub mod ffi;

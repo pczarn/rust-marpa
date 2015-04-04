@@ -1,6 +1,9 @@
+#![feature(custom_derive)] 
+
 use {Config, Bocage, Grammar, Order, Recognizer, Step, Tree};
 
-use std::str::CowString;
+use std::string::CowString;
+use std::borrow::IntoCow;
 
 #[test]
 fn test_simple_with_cfg() {
@@ -8,7 +11,7 @@ fn test_simple_with_cfg() {
     Grammar::with_config(&mut cfg).unwrap();
 }
 
-#[deriving(Show)]
+#[derive(Clone, Debug)]
 struct Node {
     formatted: CowString<'static>,
     value: u32,
@@ -16,8 +19,8 @@ struct Node {
 
 #[test]
 fn test_ambiguous_parse() {
-    let tok_strings = [".", "1", "2", "3", "0", "-", "+", "*"];
-    let tok_value = [0, 1, 2, 3, 0, 0, 0, 0];
+    let tok_strings = [".", "1", "2", "3", "0", "-", "+", "*", ","];
+    let tok_value = [0,  1, 2, 3, 0,  0, 0, 0, 0];
     let expected = [
         ("(2-(0*(3+1))) == 2", 2),
         ("(((2-0)*3)+1) == 7", 7),
@@ -31,20 +34,24 @@ fn test_ambiguous_parse() {
 
     let s = g.symbol_new().unwrap();
     let e = g.symbol_new().unwrap();
+    let seq = g.symbol_new().unwrap();
     let op = g.symbol_new().unwrap();
     let number = g.symbol_new().unwrap();
+    let comma = g.symbol_new().unwrap();
     g.start_symbol_set(s);
-    let start_rule  = g.rule_new(s, &[e]).unwrap();
+    let start_rule  = g.rule_new(s, &[seq]).unwrap();
+    let seq_rule = g.sequence_new(seq, e, comma).unwrap();
     let op_rule     = g.rule_new(e, &[e, op, e]).unwrap();
+    // let comma_rule = g.rule_new(e, &[number]).unwrap();
     let number_rule = g.rule_new(e, &[number]).unwrap();
     g.precompute().unwrap();
 
     let mut r = Recognizer::new(&mut g).unwrap();
     r.start_input();
 
-    let tok_symbols = [number, number, number, number, number, op, op, op];
+    let tok_symbols = [number, number, number, number, number, op, op, op, comma];
 
-    for ch in "2 - 0 * 3 + 1".chars() {
+    for ch in "2 - 0 * 3 + 1,1,1,2-0,".chars() {
         match tok_strings.iter().position(|&tok| tok.char_at(0) == ch) {
             Some(pos) => {
                 r.alternative(tok_symbols[pos], pos as i32, 1);
@@ -65,6 +72,7 @@ fn test_ambiguous_parse() {
         valuator.rule_is_valued_set(op_rule, 1);
         valuator.rule_is_valued_set(start_rule, 1);
         valuator.rule_is_valued_set(number_rule, 1);
+        valuator.rule_is_valued_set(seq_rule, 1);
 
         loop {
             let (idx, elem) = match valuator.step() {
@@ -104,16 +112,20 @@ fn test_ambiguous_parse() {
                                 _ => panic!("unknown op"),
                             },
                         }
+                    } else if seq_rule == rule {
+                        println!("{:?}", (arg_0, arg_n, stack.len()));
+                        stack[arg_0].clone()
                     } else {
                         panic!("unknown rule")
                     };
 
+                    // println!("{:?}", (arg_0, arg_n));
                     (arg_0, elem)
                 }
                 Step::StepInactive => {
                     break;
                 }
-                other => panic!("unexpected step {}", other),
+                other => panic!("unexpected step {:?}", other),
             };
 
             if idx == stack.len() {
@@ -128,10 +140,10 @@ fn test_ambiguous_parse() {
             match expected.iter().find(|&&(ref s, _)| **s == **result_str) {
                 Some(&(_, val)) => {
                     if val != result_val {
-                        panic!("expected {}, but found {}", val, stack[0]);
+                        panic!("expected {:?}, but found {:?}", val, stack[0]);
                     }
                 }
-                None => panic!("totally unexpected {}", stack[0])
+                None => panic!("totally unexpected {:?}", stack[0])
             }
         };
         stack.clear();

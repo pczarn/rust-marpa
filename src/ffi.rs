@@ -4,13 +4,13 @@ pub type EarleySetId = i32;
 pub type EarleyItemId = i32;
 pub type EarlemeId = i32;
 
-#[deriving(Copy)] pub enum MarpaGrammar {}
-#[deriving(Copy)] pub enum MarpaRecce {}
-#[deriving(Copy)] pub enum MarpaBocage {}
-#[deriving(Copy)] pub enum MarpaOrder {}
-#[deriving(Copy)] pub enum MarpaTree {}
+#[derive(Copy)] pub enum MarpaGrammar {}
+#[derive(Copy)] pub enum MarpaRecce {}
+#[derive(Copy)] pub enum MarpaBocage {}
+#[derive(Copy)] pub enum MarpaOrder {}
+#[derive(Copy)] pub enum MarpaTree {}
 
-#[deriving(Copy)]
+#[derive(Copy)]
 #[repr(C)]
 pub struct MarpaValue {
     pub t_step_type: Step,
@@ -27,8 +27,8 @@ pub struct MarpaValue {
 
 /// The configuration structure is intended for future extensions. Currently, the only function
 /// of the config is to give `Grammar::with_config` a place to put its error code.
-#[allow(raw_pointer_deriving)]
-#[deriving(Copy)]
+#[allow(raw_pointer_derive)]
+#[derive(Copy)]
 #[repr(C)]
 pub struct Config {
     t_is_ok: i32,
@@ -42,7 +42,7 @@ impl Config {
         let mut cfg = Config {
             t_is_ok: 0,
             t_error: ErrorCode::ErrNone,
-            t_error_str: 0u as *const _
+            t_error_str: 0usize as *const _
         };
         unsafe { marpa_c_init(&mut cfg); }
         cfg
@@ -53,7 +53,7 @@ impl Config {
     }
 }
 
-#[deriving(Copy, Show)]
+#[derive(Copy, Debug)]
 #[repr(C)]
 pub enum Step {
     StepInternal1 = 0,
@@ -67,7 +67,7 @@ pub enum Step {
     StepCount = 8,
 }
 
-#[deriving(Copy, Show)]
+#[derive(Copy, Debug)]
 #[repr(i32)]
 pub enum ErrorCode {
     ErrNone = 0,
@@ -186,6 +186,10 @@ extern {
     pub fn marpa_g_start_symbol_set(grammar: *mut MarpaGrammar, sym: SymbolId) -> SymbolId;
     pub fn marpa_g_rule_new(g: *mut MarpaGrammar, lhs_id: SymbolId, rhs_ids: *const SymbolId,
                                                                     length: i32) -> RuleId;
+    pub fn marpa_g_sequence_new(g: *mut MarpaGrammar, lhs_id: SymbolId, rhs_id: SymbolId,
+                                                                        sep_id: SymbolId,
+                                                                        min: i32,
+                                                                        flags: i32) -> RuleId;
 
     pub fn marpa_g_error(grammar: *mut MarpaGrammar, p_error_string: *const *const u8) -> ErrorCode;
     pub fn marpa_g_error_clear(grammar: *mut MarpaGrammar) -> ErrorCode;
@@ -199,6 +203,7 @@ extern {
                                                        length: i32) -> ErrorCode;
     pub fn marpa_r_earleme_complete(recce: *mut MarpaRecce) -> EarlemeId;
     pub fn marpa_r_latest_earley_set(recce: *mut MarpaRecce) -> EarleySetId;
+    pub fn marpa_r_terminals_expected(recce: *mut MarpaRecce, ary: *mut SymbolId) -> i32;
 
     pub fn marpa_b_new(recce: *mut MarpaRecce, earley_set_id: EarleySetId) -> *mut MarpaBocage;
     pub fn marpa_b_unref(r: *mut MarpaBocage);
