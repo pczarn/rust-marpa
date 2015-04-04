@@ -227,7 +227,7 @@
             Spec24(::syntax::parse::token::Token),
             Spec25(Context),
             Spec26(Opt),
-            Spec27(L0Rule),
+            Spec27(LexRule),
             Spec28(Rule),
             Spec29(Alternative),
             Spec30(Alt),
@@ -250,7 +250,7 @@
             Spec47(()),
             Spec48(Opt),
             Spec49(Rule),
-            Spec50(L0Rule),
+            Spec50(LexRule),
             Spec51(Alternative),
             Spec52(()),
             Spec53(Alt),
@@ -262,7 +262,7 @@
             Spec59(Option<PathParameters>),
             Spec60(Vec<Opt>),
             Spec61(Vec<Rule>),
-            Spec62(Vec<L0Rule>),
+            Spec62(Vec<LexRule>),
             Spec63(Vec<Alternative>),
             Spec64(Vec<Alt>),
             Spec65(Vec<Expr>),
@@ -680,7 +680,7 @@
                                                                            opt,
                                                                        rules:
                                                                            statements,
-                                                                       l0_rules:
+                                                                       lex_rules:
                                                                            l0_statements,}
                                                            }
                                                        }
@@ -735,7 +735,7 @@
                                                                    } else {
                                                                        None
                                                                    };
-                                                               L0Rule{name:
+                                                               LexRule{name:
                                                                           i.name,
                                                                       ty: ty,
                                                                       pat:

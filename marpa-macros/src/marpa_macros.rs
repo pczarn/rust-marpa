@@ -52,7 +52,7 @@ pub fn plugin_registrar(reg: &mut ::rustc::plugin::Registry) {
 struct Context {
     options: Vec<Opt>,
     rules: Vec<Rule>,
-    l0_rules: Vec<L0Rule>,
+    lex_rules: Vec<LexRule>,
 }
 
 #[derive(Debug)]
@@ -63,7 +63,7 @@ struct Rule {
 }
 
 #[derive(Debug)]
-struct L0Rule {
+struct LexRule {
     name: ast::Name,
     ty: P<Ty>,
     pat: Option<P<Pat>>,
@@ -288,7 +288,7 @@ pub enum RustToken {
     Tok(Token)
 }
 
-fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, (u32, u32)>, Option<L0Rule>) {
+fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::Name, (u32, u32)>, Option<LexRule>) {
     type Alt = (Option<P<Pat> >, Expr);
 
     let mut grammar =
@@ -297,11 +297,11 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
         enum_adaptor!(RustToken);
 
         start -> Context ::=
-            opt:[option]* statements:[stmt]* l0_statements:[l0_stmt]* {
+            opts:[option]* stmts:[stmt]* lex_stmts:[lex_stmt]* {
                 Context {
-                    options: opt,
-                    rules: statements,
-                    l0_rules: l0_statements
+                    options: opts,
+                    rules: stmts,
+                    lex_rules: lex_stmts
                 }
             } ;
 
@@ -310,8 +310,8 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
                 Opt { ident: i, tokens: quote_tokens(cx, tts) }
             } ;
 
-        l0_stmt -> L0Rule ::=
-            i:ident rarrow ty:ty squiggly (mut rhs):paren_bracket_tts b:inline_action semi {
+        lex_stmt -> LexRule ::=
+            i:ident rarrow ty:ty squiggly (mut rhs):paren_bracket_tts action:inline_action semi {
                 let pat = if rhs[1] == Colon {
                     let p = quote_pat(cx, rhs.clone());
                     rhs.remove(0);
@@ -320,7 +320,13 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
                 } else {
                     None
                 };
-                L0Rule { name: i.name, ty: ty, pat: pat, rhs: rhs, action: b }
+                LexRule {
+                    name: i.name,
+                    ty: ty,
+                    pat: pat,
+                    rhs: rhs,
+                    action: action
+                }
             } ;
 
         stmt -> Rule ::=
@@ -345,21 +351,21 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
             } ;
  
         pat_expr -> Alt ::=
-            pat:bind_pat? a:atom {
-                (pat, a)
+            pat:bind_pat? e:expr {
+                (pat, e)
             } ;
 
         expr_list -> Vec<Expr> ::=
-            a:[atom]* {
-                a
+            ary:[expr]* {
+                ary
             } ;
 
-        atom -> Expr ::=
+        expr -> Expr ::=
             i:ident {
                 NameExpr(i.name)
             }
-            | a:atom question {
-                ExprOptional(box a)
+            | e:expr question {
+                ExprOptional(box e)
             }
             | lbracket body:expr_list rbracket lbrace sep:expr_list rbrace op:kleene_op {
                 ExprSeq(body, Some(sep), op)
@@ -387,6 +393,7 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
                 InlineAction { block: Some(block) }
             } ;
 
+        // Rust's type
         ty -> P<Ty> ::=
             t:ty_ {
                 P(Ty {
@@ -396,18 +403,18 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
                 })
             } ;
 
-        // Rust's type
         ty_ -> Ty_ ::=
             path:path {
                 TyPath(None, path)
             }
-            | lparen tup:[ty]{comma}* rparen {
+            | lparen rparen {
                 TyTup(Vec::new())
             }
             | underscore {
                 TyInfer
             } ;
 
+        // Rust's path
         path -> ast::Path ::=
             global:mod_sep? ps:[path_segment]{mod_sep}+ {
                 ast::Path {
@@ -442,6 +449,7 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
                 quote_block(cx, tts)
             } ;
 
+        // Rust's token trees, should be replaced with more grammar
         token_tree -> Vec<Token> ::=
             tt:brace_tt {
                 tt
@@ -519,7 +527,7 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
         // `::=`
         mod_eq -> () ::= mod_sep eq {};
 
-        // Tokenization is performed by Rust's lexer. Use the enum adaptor to
+        // Tokenization is performed by Rust's lexer. Using the enum adaptor to
         // read tokens.
         squiggly -> () ~ Tok(Tilde) {} ;
         ident -> ::syntax::ast::Ident ~
@@ -604,7 +612,7 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
         ast.rules = rules;
 
         let mut rules = vec![];
-        for rule in ast.l0_rules.drain() {
+        for rule in ast.lex_rules.drain() {
             if rule.name.as_str() == "discard" {
                 discard_rule = Some(rule);
                 continue;
@@ -619,7 +627,7 @@ fn parse_ast(cx: &mut ExtCtxt, tokens: &[RustToken]) -> (Context, HashMap<ast::N
                 }
             }
         }
-        ast.l0_rules = rules;
+        ast.lex_rules = rules;
 
         ast_ = Some(ast);
         namespace_ = Some(namespace);
@@ -660,7 +668,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     {
         let mut cx = ExtractionContext {
             namespace: &mut namespace,
-            l0_types: ast.l0_rules.iter().map(|r| r.ty.clone()).collect(),
+            l0_types: ast.lex_rules.iter().map(|r| r.ty.clone()).collect(),
             types: ast.rules.iter().map(|r| r.ty.clone()).collect(),
             sp: sp,
             ext: cx,
@@ -684,21 +692,21 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
     }
 
     let (variant_names, variant_tys): (Vec<_>, Vec<_>) =
-            ast.l0_rules.iter().map(|r| &r.ty)
+            ast.lex_rules.iter().map(|r| &r.ty)
                 .chain(ast.rules.iter().map(|r| &r.ty))
                 .chain(seq_rules.iter().map(|r| &r.ty))
                 .enumerate().map(|(n, ty)| {
         (repr_variant(n as u32), ty.clone())
     }).unzip();
 
-    let num_syms = ast.l0_rules.len() + ast.rules.len() + seq_rules.len();
-    let num_scan_syms = ast.l0_rules.len();
+    let num_syms = ast.lex_rules.len() + ast.rules.len() + seq_rules.len();
+    let num_scan_syms = ast.lex_rules.len();
     let num_rule_alts = ast.rules.iter().map(|rule| rule.rhs.len()).sum();
     // let num_rules = ast.rules.len();
     let num_seq_rules = seq_rules.len();
     let num_rule_ids = num_rule_alts + num_seq_rules;
-    let offset_rules = ast.l0_rules.len();
-    let offset_seq_rules = ast.l0_rules.len() + ast.rules.len();
+    let offset_rules = ast.lex_rules.len();
+    let offset_seq_rules = ast.lex_rules.len() + ast.rules.len();
 
     // renumerate
     for (_, &mut (kind, ref mut nth)) in namespace.iter_mut() {
@@ -761,7 +769,7 @@ fn expand_grammar(cx: &mut ExtCtxt, sp: Span, tts: &[TokenTree])
                                    .into_iter()
                                    .collect::<Vec<_>>();
 
-    for (nth, rule) in ast.l0_rules.iter().enumerate() {
+    for (nth, rule) in ast.lex_rules.iter().enumerate() {
         lex_cond_n.push(nth);
         lex_tup_pat.push(rule.pat.clone().unwrap_or_else(|| cx.pat_wild(sp)));
         lex_action.push(rule.action.block.clone().unwrap());
