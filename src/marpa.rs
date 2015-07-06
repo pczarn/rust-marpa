@@ -6,7 +6,7 @@ use std::ptr;
 macro_rules! numbered_object_type {
     ($Ty:ident, $Id:ty) => (
         #[repr(packed)]
-        #[deriving(Copy, PartialEq, Eq)]
+        #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
         pub struct $Ty {
             id: $Id,
         }
@@ -29,7 +29,7 @@ numbered_object_type!(EarleySet, ffi::EarleySetId);
 numbered_object_type!(Symbol, ffi::SymbolId);
 numbered_object_type!(Rule, ffi::RuleId);
 
-
+const PROPER_SEPARATION: i32 = 2;
 
 /// A grammar. Grammars have no parent objects.
 pub struct Grammar {
@@ -77,6 +77,15 @@ impl Grammar {
     pub fn rule_new(&mut self, lhs: Symbol, rhs: &[Symbol]) -> Option<Rule> {
         Rule::new(unsafe {
             ffi::marpa_g_rule_new(self.grammar, lhs.id, rhs.as_ptr() as *const _, rhs.len() as i32)
+        })
+    }
+
+    /// Creates a new sequence rule. Returns `None` on failure.
+    pub fn sequence_new(&mut self, lhs: Symbol, rhs: Symbol, sep: Option<Symbol>, min: i32)
+                       -> Option<Rule> {
+        Rule::new(unsafe {
+            let sep = sep.unwrap_or(Symbol { id: -1 });
+            ffi::marpa_g_sequence_new(self.grammar, lhs.id, rhs.id, sep.id, min, PROPER_SEPARATION)
         })
     }
 
@@ -141,19 +150,20 @@ impl Drop for Grammar {
 
 pub struct Recognizer {
     recce: *mut ffi::MarpaRecce,
+    grammar: *mut ffi::MarpaGrammar,
 }
 
 impl Recognizer {
     /// Constructs a new recognizer. Returns `None` if `grammar` is not precomputed, or on other
     /// failure.
-    pub fn new(grammar: &mut Grammar) -> Option<Recognizer> {
+    pub fn new(grammar: &mut Grammar) -> Result<Recognizer, ErrorCode> {
         let recce_ptr = unsafe {
             ffi::marpa_r_new(grammar.grammar)
         };
         if recce_ptr.is_null() {
-            None
+            Err(unsafe { ffi::marpa_g_error(grammar.grammar, ptr::null()) })
         } else {
-            Some(Recognizer { recce: recce_ptr })
+            Ok(Recognizer { recce: recce_ptr, grammar: grammar.grammar })
         }
     }
 
@@ -186,6 +196,12 @@ impl Recognizer {
             ffi::marpa_r_latest_earley_set(self.recce)
         }).unwrap()
     }
+
+    pub unsafe fn terminals_expected<'a>(&self, ary: &'a mut [Symbol]) -> &'a [Symbol] {
+        let n = ffi::marpa_r_terminals_expected(self.recce, ary.as_mut_ptr() as *mut _);
+        assert!(n >= 0);
+        &ary[..n as usize]
+    }
 }
 
 impl Drop for Recognizer {
@@ -198,18 +214,19 @@ impl Drop for Recognizer {
 
 pub struct Bocage {
     bocage: *mut ffi::MarpaBocage,
+    grammar: *mut ffi::MarpaGrammar,
 }
 
 impl Bocage {
     /// Constructs a new bocage. Returns `None` on failure.
-    pub fn new(recce: &mut Recognizer, earley_set: EarleySet) -> Option<Bocage> {
+    pub fn new(recce: &mut Recognizer, earley_set: EarleySet) -> Result<Bocage, ErrorCode> {
         let bocage_ptr = unsafe {
             ffi::marpa_b_new(recce.recce, earley_set.id)
         };
         if bocage_ptr.is_null() {
-            None
+            Err(unsafe { ffi::marpa_g_error(recce.grammar, ptr::null()) })
         } else {
-            Some(Bocage { bocage: bocage_ptr })
+            Ok(Bocage { bocage: bocage_ptr, grammar: recce.grammar })
         }
     }
 }
@@ -224,18 +241,19 @@ impl Drop for Bocage {
 
 pub struct Order {
     order: *mut ffi::MarpaOrder,
+    grammar: *mut ffi::MarpaGrammar,
 }
 
 impl Order {
     /// Constructs a new order. Returns `None` on failure.
-    pub fn new(bocage: &mut Bocage) -> Option<Order> {
+    pub fn new(bocage: &mut Bocage) -> Result<Order, ErrorCode> {
         let order_ptr = unsafe {
             ffi::marpa_o_new(bocage.bocage)
         };
         if order_ptr.is_null() {
-            None
+            Err(unsafe { ffi::marpa_g_error(bocage.grammar, ptr::null()) })
         } else {
-            Some(Order { order: order_ptr })
+            Ok(Order { order: order_ptr, grammar: bocage.grammar })
         }
     }
 }
@@ -250,17 +268,18 @@ impl Drop for Order {
 
 pub struct Tree {
     tree: *mut ffi::MarpaTree,
+    grammar: *mut ffi::MarpaGrammar,
 }
 
 impl Tree {
-    pub fn new(order: &mut Order) -> Option<Tree> {
+    pub fn new(order: &mut Order) -> Result<Tree, ErrorCode> {
         let tree_ptr = unsafe {
             ffi::marpa_t_new(order.order)
         };
         if tree_ptr.is_null() {
-            None
+            Err(unsafe { ffi::marpa_g_error(order.grammar, ptr::null()) })
         } else {
-            Some(Tree { tree: tree_ptr })
+            Ok(Tree { tree: tree_ptr, grammar: order.grammar })
         }
     }
 
@@ -290,14 +309,14 @@ pub struct Value {
 }
 
 impl Value {
-    pub fn new(tree: &mut Tree) -> Option<Value> {
+    pub fn new(tree: &mut Tree) -> Result<Value, ErrorCode> {
         let val_ptr = unsafe {
             ffi::marpa_v_new(tree.tree)
         };
         if val_ptr.is_null() {
-            None
+            Err(unsafe { ffi::marpa_g_error(tree.grammar, ptr::null()) })
         } else {
-            Some(Value { value: val_ptr })
+            Ok(Value { value: val_ptr })
         }
     }
 
@@ -317,6 +336,10 @@ impl Value {
         unsafe {
             ffi::marpa_v_symbol_is_valued_set(self.value, sym.id, n);
         }
+    }
+
+    pub fn symbol(&self) -> Symbol {
+        unsafe { Symbol::new((*self.value).t_token_id).unwrap() }
     }
 
     pub fn rule(&self) -> Rule {
@@ -354,10 +377,11 @@ pub struct Values<'a> {
     tree: &'a mut Tree,
 }
 
-impl<'a> Iterator<Value> for Values<'a> {
+impl<'a> Iterator for Values<'a> {
+    type Item = Value;
     fn next(&mut self) -> Option<Value> {
         if self.tree.next() >= 0 {
-            Value::new(self.tree)
+            Value::new(self.tree).ok()
         } else {
             None
         }

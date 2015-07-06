@@ -1,9 +1,12 @@
 [package]
 
 name = "rust-marpa"
-version = "0.0.1"
+version = "0.1.0"
 authors = [ "pioczarn@gmail.com" ]
 
 [lib]
 name = "marpa"
 crate_type = ["dylib"]
+
+[dependencies.marpa-sys]
+path = "marpa-sys/"

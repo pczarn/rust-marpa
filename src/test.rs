@@ -1,6 +1,6 @@
 use {Config, Bocage, Grammar, Order, Recognizer, Step, Tree};
 
-use std::str::CowString;
+use std::borrow::Cow;
 
 #[test]
 fn test_simple_with_cfg() {
@@ -8,9 +8,9 @@ fn test_simple_with_cfg() {
     Grammar::with_config(&mut cfg).unwrap();
 }
 
-#[deriving(Show)]
+#[derive(Clone, Debug)]
 struct Node {
-    formatted: CowString<'static>,
+    formatted: Cow<'static, str>,
     value: u32,
 }
 
@@ -45,7 +45,7 @@ fn test_ambiguous_parse() {
     let tok_symbols = [number, number, number, number, number, op, op, op];
 
     for ch in "2 - 0 * 3 + 1".chars() {
-        match tok_strings.iter().position(|&tok| tok.char_at(0) == ch) {
+        match tok_strings.iter().position(|&tok| tok.find(ch) == Some(0)) {
             Some(pos) => {
                 r.alternative(tok_symbols[pos], pos as i32, 1);
                 r.earleme_complete();
@@ -69,34 +69,34 @@ fn test_ambiguous_parse() {
         loop {
             let (idx, elem) = match valuator.step() {
                 Step::StepToken => {
-                    let tok_idx = valuator.token_value() as uint;
-                    (valuator.result() as uint,
+                    let tok_idx = valuator.token_value() as usize;
+                    (valuator.result() as usize,
                      Node {
-                        formatted: tok_strings[tok_idx].into_cow(),
+                        formatted: tok_strings[tok_idx].into(),
                         value: tok_value[tok_idx],
                      })
                 }
                 Step::StepRule => {
                     let rule = valuator.rule();
-                    let arg_0 = valuator.arg_0() as uint;
-                    let arg_n = valuator.arg_n() as uint;
+                    let arg_0 = valuator.arg_0() as usize;
+                    let arg_n = valuator.arg_n() as usize;
                     let &Node { formatted: ref left_str,  value: lval } = &stack[arg_0];
                     let &Node { formatted: ref right_str, value: rval } = &stack[arg_n];
 
                     let elem = if start_rule == rule {
                         Node {
-                            formatted: format!("{} == {}", right_str, rval).into_cow(),
+                            formatted: format!("{} == {}", right_str, rval).into(),
                             value: rval,
                         }
                     } else if number_rule == rule {
                         Node {
-                            formatted: lval.to_string().into_cow(),
+                            formatted: lval.to_string().into(),
                             value: lval,
                         }
                     } else if op_rule == rule {
-                        let op = stack[arg_0 + 1].formatted.as_slice();
+                        let op = &stack[arg_0 + 1].formatted[..];
                         Node {
-                            formatted: format!("({}{}{})", left_str, op, right_str).into_cow(),
+                            formatted: format!("({}{}{})", left_str, op, right_str).into(),
                             value: match op {
                                 "+" => lval + rval,
                                 "-" => lval - rval,
@@ -113,7 +113,7 @@ fn test_ambiguous_parse() {
                 Step::StepInactive => {
                     break;
                 }
-                other => panic!("unexpected step {}", other),
+                other => panic!("unexpected step {:?}", other),
             };
 
             if idx == stack.len() {
@@ -128,10 +128,10 @@ fn test_ambiguous_parse() {
             match expected.iter().find(|&&(ref s, _)| **s == **result_str) {
                 Some(&(_, val)) => {
                     if val != result_val {
-                        panic!("expected {}, but found {}", val, stack[0]);
+                        panic!("expected {:?}, but found {:?}", val, stack[0]);
                     }
                 }
-                None => panic!("totally unexpected {}", stack[0])
+                None => panic!("totally unexpected {:?}", stack[0])
             }
         };
         stack.clear();

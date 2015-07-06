@@ -1,13 +1,13 @@
 #![crate_name = "marpa"]
 
-#![feature(plugin_registrar, macro_rules, unsafe_destructor)]
+#![feature(plugin_registrar, libc)]
 
 extern crate libc;
+extern crate marpa_sys as ffi;
 
-pub use ffi::{Config, Step};
-pub use marpa::{Grammar, Bocage, Order, Recognizer, Tree, Value};
+pub use ffi::{Config, Step, ErrorCode};
+pub use marpa::{Grammar, Bocage, Order, Recognizer, Tree, Value, Symbol, Rule};
 
-pub mod ffi;
 pub mod marpa;
 
 #[cfg(test)]
